@@ -123,7 +123,8 @@ public class LogMinerStreamingChangeEventSource implements StreamingChangeEventS
     public void execute(ChangeEventSourceContext context, OraclePartition partition, OracleOffsetContext offsetContext) {
         final boolean plSqlOutputStrategy = isPlSqlOutputStrategy();
         if (plSqlOutputStrategy || LOGGER.isInfoEnabled()) {
-            LOGGER.info("{} streaming execute entered: configuredStrategy={}, effectiveStrategy={}, snapshotMode={}, offsetScn={}, snapshotScn={}, offsetCommitScn={}, archiveLogOnlyMode={}, continuousMining={}, bufferType={}, capturedTables={}",
+            LOGGER.info(
+                    "{} streaming execute entered: configuredStrategy={}, effectiveStrategy={}, snapshotMode={}, offsetScn={}, snapshotScn={}, offsetCommitScn={}, archiveLogOnlyMode={}, continuousMining={}, bufferType={}, capturedTables={}",
                     logPrefix(), connectorConfig.getLogMiningStrategy(), strategy, connectorConfig.getSnapshotMode(),
                     offsetContext.getScn(), offsetContext.getSnapshotScn(), offsetContext.getCommitScn(),
                     archiveLogOnlyMode, isContinuousMining, connectorConfig.getLogMiningBufferType(), schema.tableIds());
@@ -143,7 +144,8 @@ public class LogMinerStreamingChangeEventSource implements StreamingChangeEventS
             logPlSqlOutputProgress("loading oldest SCN from redo/archive logs");
             Scn firstScn = getFirstScnInLogs(jdbcConnection);
             if (plSqlOutputStrategy) {
-                LOGGER.info("{} streaming starting: offsetScn={}, snapshotScn={}, firstScnInLogs={}, archiveLogOnlyMode={}, continuousMining={}, batchSize={}, sleepMs={}",
+                LOGGER.info(
+                        "{} streaming starting: offsetScn={}, snapshotScn={}, firstScnInLogs={}, archiveLogOnlyMode={}, continuousMining={}, batchSize={}, sleepMs={}",
                         PLSQL_OUTPUT_LOG_PREFIX,
                         startScn, snapshotScn, firstScn, archiveLogOnlyMode, isContinuousMining,
                         streamingMetrics.getBatchSize(), streamingMetrics.getMillisecondToSleepBetweenMiningQuery());
@@ -245,13 +247,14 @@ public class LogMinerStreamingChangeEventSource implements StreamingChangeEventS
                             else {
                                 retryAttempts = 1;
                                 if (plSqlOutputStrategy) {
-                                    LOGGER.info("{} processing window: scnRange=[{}, {}], offsetScn={}, offsetCommitScn={}",
+                                    LOGGER.debug("{} processing window: scnRange=[{}, {}], offsetScn={}, offsetCommitScn={}",
                                             PLSQL_OUTPUT_LOG_PREFIX,
                                             startScn, endScn, offsetContext.getScn(), offsetContext.getCommitScn());
                                 }
                                 final Scn nextStartScn = processor.process(partition, startScn, endScn);
                                 if (plSqlOutputStrategy) {
-                                    LOGGER.info("{} processed window: scnRange=[{}, {}], nextStartScn={}, durationMs={}, offsetScn={}, offsetCommitScn={}, activeTransactions={}, sleepMs={}",
+                                    LOGGER.debug(
+                                            "{} processed window: scnRange=[{}, {}], nextStartScn={}, durationMs={}, offsetScn={}, offsetCommitScn={}, activeTransactions={}, sleepMs={}",
                                             PLSQL_OUTPUT_LOG_PREFIX,
                                             startScn, endScn, nextStartScn, Duration.between(start, Instant.now()).toMillis(),
                                             offsetContext.getScn(), offsetContext.getCommitScn(),
@@ -386,7 +389,8 @@ public class LogMinerStreamingChangeEventSource implements StreamingChangeEventS
             throws SQLException {
         Instant start = Instant.now();
         if (isPlSqlOutputStrategy()) {
-            LOGGER.info("{} initializing redo logs: startScn={}, endScn={}, postEndMiningSession={}, archiveLogOnlyMode={}, archiveDestination={}, retention={}, continuousMining={}",
+            LOGGER.info(
+                    "{} initializing redo logs: startScn={}, endScn={}, postEndMiningSession={}, archiveLogOnlyMode={}, archiveDestination={}, retention={}, continuousMining={}",
                     PLSQL_OUTPUT_LOG_PREFIX, startScn, endScn, postEndMiningSession, archiveLogOnlyMode, archiveDestinationName,
                     archiveLogRetention, isContinuousMining);
         }
@@ -440,7 +444,8 @@ public class LogMinerStreamingChangeEventSource implements StreamingChangeEventS
         plSqlOutputMiningLoopCount++;
         final Instant now = Instant.now();
         if (Duration.between(lastPlSqlOutputStatusLogTime, now).compareTo(PLSQL_OUTPUT_STATUS_LOG_INTERVAL) >= 0) {
-            LOGGER.info("{} loop: loop={}, scnRange=[{}, {}], offsetScn={}, offsetCommitScn={}, currentBatchSize={}, sleepMs={}, activeTransactions={}, currentRedoLogSequences={}",
+            LOGGER.info(
+                    "{} loop: loop={}, scnRange=[{}, {}], offsetScn={}, offsetCommitScn={}, currentBatchSize={}, sleepMs={}, activeTransactions={}, currentRedoLogSequences={}",
                     PLSQL_OUTPUT_LOG_PREFIX, plSqlOutputMiningLoopCount, startScn, endScn, offsetContext.getScn(),
                     offsetContext.getCommitScn(), streamingMetrics.getBatchSize(),
                     streamingMetrics.getMillisecondToSleepBetweenMiningQuery(),
@@ -635,7 +640,7 @@ public class LogMinerStreamingChangeEventSource implements StreamingChangeEventS
         Instant start = Instant.now();
         OffsetDateTime systemTime = connection.singleOptionalValue("SELECT SYSTIMESTAMP FROM DUAL", rs -> rs.getObject(1, OffsetDateTime.class));
         if (isPlSqlOutputStrategy()) {
-            LOGGER.info("{} database system time loaded in {} ms: systemTime={}", PLSQL_OUTPUT_LOG_PREFIX,
+            LOGGER.debug("{} database system time loaded in {} ms: systemTime={}", PLSQL_OUTPUT_LOG_PREFIX,
                     Duration.between(start, Instant.now()).toMillis(), systemTime);
         }
         return systemTime;
@@ -659,7 +664,7 @@ public class LogMinerStreamingChangeEventSource implements StreamingChangeEventS
         LOGGER.trace("Starting mining session startScn={}, endScn={}, strategy={}, continuous={}",
                 startScn, endScn, strategy, isContinuousMining);
         if (isPlSqlOutputStrategy()) {
-            LOGGER.info("PL/SQL output LogMiner starting mining session: startScn={}, endScn={}, attempt={}, continuousMining={}",
+            LOGGER.debug("PL/SQL output LogMiner starting mining session: startScn={}, endScn={}, attempt={}, continuousMining={}",
                     startScn, endScn, attempts, isContinuousMining);
         }
         try {
@@ -670,7 +675,7 @@ public class LogMinerStreamingChangeEventSource implements StreamingChangeEventS
             Duration duration = Duration.between(start, Instant.now());
             streamingMetrics.addCurrentMiningSessionStart(duration);
             if (isPlSqlOutputStrategy()) {
-                LOGGER.info("PL/SQL output LogMiner mining session started in {} ms: startScn={}, endScn={}",
+                LOGGER.debug("PL/SQL output LogMiner mining session started in {} ms: startScn={}, endScn={}",
                         duration.toMillis(), startScn, endScn);
             }
             return true;

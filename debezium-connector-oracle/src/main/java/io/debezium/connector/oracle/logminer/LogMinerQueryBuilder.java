@@ -27,8 +27,10 @@ public class LogMinerQueryBuilder {
             + "FROM " + LOGMNR_CONTENTS_VIEW + " ";
     private static final String PLSQL_OUTPUT_TABLE_NAME = "NVL(TABLE_NAME, SEG_NAME)";
     private static final String PLSQL_OUTPUT_SELECT_LIST = "SELECT SCN, SQL_REDO, OPERATION_CODE, TIMESTAMP AS CHANGE_TIME, LOWER(RAWTOHEX(XID)) AS XID_HEX, "
-            + "CSF, " + PLSQL_OUTPUT_TABLE_NAME + " AS TABLE_NAME, SEG_OWNER, OPERATION, USERNAME, ROW_ID, ROLLBACK AS ROLLBACK_FLAG, RS_ID, STATUS, INFO, SSN, THREAD# AS THREAD_NUMBER "
+            + "CSF, " + PLSQL_OUTPUT_TABLE_NAME
+            + " AS TABLE_NAME, SEG_OWNER, OPERATION, USERNAME, ROW_ID, ROLLBACK AS ROLLBACK_FLAG, RS_ID, STATUS, INFO, SSN, THREAD# AS THREAD_NUMBER "
             + "FROM " + LOGMNR_CONTENTS_VIEW + " ";
+    private static final int PLSQL_OUTPUT_MAX_BYTES = 64 * 1024 * 1024;
 
     /**
      * Builds the LogMiner contents view query.
@@ -154,26 +156,172 @@ public class LogMinerQueryBuilder {
     }
 
     public static String buildPlSqlOutputBlock(OracleConnectorConfig connectorConfig, OracleDatabaseSchema schema) {
-        final String query = build(connectorConfig, schema)
-                .replace(SELECT_LIST, PLSQL_OUTPUT_SELECT_LIST)
-                .replace("TABLE_NAME != '" + LogWriterFlushStrategy.LOGMNR_FLUSH_TABLE + "'", PLSQL_OUTPUT_TABLE_NAME + " != '" + LogWriterFlushStrategy.LOGMNR_FLUSH_TABLE + "'")
-                .replace("TABLE_NAME IS NULL OR TABLE_NAME NOT LIKE 'ORA_TEMP_%'", PLSQL_OUTPUT_TABLE_NAME + " IS NULL OR " + PLSQL_OUTPUT_TABLE_NAME + " NOT LIKE 'ORA_TEMP_%'")
-                .replace("SEG_OWNER || '.' || TABLE_NAME", "SEG_OWNER || '.' || " + PLSQL_OUTPUT_TABLE_NAME);
+        final String dmlOperationCodes = connectorConfig.isLobEnabled() ? "1,2,3,9,10,11,29" : "1,2,3,255";
+        final String pdbPredicate = Strings.isNullOrEmpty(connectorConfig.getPdbName()) ? null : "SRC_CON_NAME = '" + connectorConfig.getPdbName() + "'";
+        final String rowPredicate = buildPlSqlCapturedTablePredicate(connectorConfig, "r.", dmlOperationCodes, pdbPredicate);
+        final String ddlPredicate = buildPlSqlDdlPredicate(connectorConfig, schema, "r.", pdbPredicate);
+        final String query = PLSQL_OUTPUT_SELECT_LIST.replace("FROM " + LOGMNR_CONTENTS_VIEW + " ", "FROM " + LOGMNR_CONTENTS_VIEW + " r ") +
+                "WHERE r.SCN > ? AND r.SCN <= ? " +
+                "AND ((" + rowPredicate + ") " +
+                "OR (r.OPERATION_CODE IN (7,34,36)) " +
+                "OR (" + ddlPredicate + "))";
 
-        return "BEGIN " +
+        return "DECLARE " +
+                "l_output_bytes NUMBER := 0; " +
+                "l_completed_scn_groups NUMBER := 0; " +
+                "l_in_csf_group BOOLEAN := FALSE; " +
+                "l_truncated BOOLEAN := FALSE; " +
+                "l_header VARCHAR2(32767); " +
+                "l_last_completed_scn VARCHAR2(64); " +
+                // Reserved byte budget for the worst-case trailing '@END|<scn>|truncated' line.
+                "l_end_reserve CONSTANT NUMBER := 64; " +
+                "l_group_scn NUMBER; " +
+                "l_have_group BOOLEAN := FALSE; " +
+                "l_group_bytes NUMBER := 0; " +
+                "l_group_line_count PLS_INTEGER := 0; " +
+                "TYPE t_output_lines IS TABLE OF VARCHAR2(32767) INDEX BY PLS_INTEGER; " +
+                "l_group_lines t_output_lines; " +
+                "FUNCTION line_bytes(p_line IN VARCHAR2) RETURN NUMBER IS " +
+                "BEGIN " +
+                "RETURN NVL(LENGTHB(p_line), 0) + 1; " +
+                "END; " +
+                "PROCEDURE put_line(p_line IN VARCHAR2) IS " +
+                "BEGIN " +
+                "DBMS_OUTPUT.PUT_LINE(p_line); " +
+                "l_output_bytes := l_output_bytes + line_bytes(p_line); " +
+                "END; " +
+                "PROCEDURE put_truncated_end IS " +
+                "BEGIN " +
+                "put_line('@END|' || NVL(l_last_completed_scn, '') || '|truncated'); " +
+                "l_truncated := TRUE; " +
+                "END; " +
+                "PROCEDURE reset_group IS " +
+                "BEGIN " +
+                "l_group_lines.DELETE; " +
+                "l_group_line_count := 0; " +
+                "l_group_bytes := 0; " +
+                "l_group_scn := NULL; " +
+                "l_have_group := FALSE; " +
+                "END; " +
+                "PROCEDURE append_group_line(p_line IN VARCHAR2) IS " +
+                "BEGIN " +
+                "l_group_line_count := l_group_line_count + 1; " +
+                "l_group_lines(l_group_line_count) := p_line; " +
+                "l_group_bytes := l_group_bytes + line_bytes(p_line); " +
+                "END; " +
+                "PROCEDURE flush_group IS " +
+                "BEGIN " +
+                "FOR i IN 1..l_group_line_count LOOP " +
+                "put_line(l_group_lines(i)); " +
+                "END LOOP; " +
+                "END; " +
+                "PROCEDURE complete_group IS " +
+                "BEGIN " +
+                "IF NOT l_have_group THEN " +
+                "RETURN; " +
+                "END IF; " +
+                "IF l_in_csf_group THEN " +
+                "RAISE_APPLICATION_ERROR(-20002, 'PL/SQL output LogMiner SCN group ended with incomplete CSF row at SCN ' || TO_CHAR(l_group_scn)); " +
+                "END IF; " +
+                "flush_group; " +
+                "l_completed_scn_groups := l_completed_scn_groups + 1; " +
+                "l_last_completed_scn := TO_CHAR(l_group_scn); " +
+                "reset_group; " +
+                "END; " +
+                "BEGIN " +
                 "DBMS_OUTPUT.DISABLE; " +
                 "DBMS_OUTPUT.ENABLE(NULL); " +
-                "FOR r IN (" + query + " ORDER BY SCN, RS_ID, SSN) LOOP " +
-                "DBMS_OUTPUT.PUT_LINE('@ROW|' || TO_CHAR(r.SCN) || '|' || TO_CHAR(r.OPERATION_CODE) || '|' || " +
+                "FOR r IN (" + query + ") LOOP " +
+                "IF l_have_group AND r.SCN < l_group_scn THEN " +
+                "RAISE_APPLICATION_ERROR(-20003, 'PL/SQL output LogMiner SCN out of order: ' || TO_CHAR(r.SCN) || ' after ' || TO_CHAR(l_group_scn)); " +
+                "END IF; " +
+                "IF l_have_group AND r.SCN > l_group_scn THEN " +
+                "complete_group; " +
+                "END IF; " +
+                "IF NOT l_have_group THEN " +
+                "l_group_scn := r.SCN; " +
+                "l_have_group := TRUE; " +
+                "END IF; " +
+                "l_header := '@ROW|' || TO_CHAR(r.SCN) || '|' || TO_CHAR(r.OPERATION_CODE) || '|' || " +
                 "TO_CHAR(r.CHANGE_TIME, 'YYYY-MM-DD HH24:MI:SS') || '|' || NVL(r.XID_HEX, '') || '|' || " +
                 "TO_CHAR(NVL(r.CSF, 0)) || '|' || NVL(r.TABLE_NAME, '') || '|' || NVL(r.SEG_OWNER, '') || '|' || " +
                 "NVL(r.OPERATION, '') || '|' || NVL(r.USERNAME, '') || '|' || NVL(r.ROW_ID, '') || '|' || " +
                 "TO_CHAR(NVL(r.ROLLBACK_FLAG, 0)) || '|' || NVL(r.RS_ID, '') || '|' || TO_CHAR(NVL(r.STATUS, 0)) || '|' || " +
                 "TO_CHAR(NVL(r.SSN, 0)) || '|' || TO_CHAR(NVL(r.THREAD_NUMBER, 0)) || '|' || " +
-                "NVL(REPLACE(REPLACE(r.INFO, CHR(13), ' '), CHR(10), ' '), '')); " +
-                "DBMS_OUTPUT.PUT_LINE(r.SQL_REDO); " +
+                "NVL(REPLACE(REPLACE(r.INFO, CHR(13), ' '), CHR(10), ' '), ''); " +
+                "append_group_line(l_header); " +
+                "append_group_line(r.SQL_REDO); " +
+                "l_in_csf_group := NVL(r.CSF, 0) <> 0; " +
+                "IF l_completed_scn_groups = 0 AND l_group_bytes + l_end_reserve > " + PLSQL_OUTPUT_MAX_BYTES + " THEN " +
+                "RAISE_APPLICATION_ERROR(-20001, 'PL/SQL output LogMiner single SCN group exceeds DBMS_OUTPUT limit of " + PLSQL_OUTPUT_MAX_BYTES
+                + " bytes at SCN ' || TO_CHAR(l_group_scn)); " +
+                "END IF; " +
+                "IF l_completed_scn_groups > 0 AND l_output_bytes + l_group_bytes + l_end_reserve > " + PLSQL_OUTPUT_MAX_BYTES + " THEN " +
+                "put_truncated_end; " +
+                "EXIT; " +
+                "END IF; " +
                 "END LOOP; " +
+                "IF NOT l_truncated THEN " +
+                "complete_group; " +
+                "END IF; " +
                 "END;";
+    }
+
+    private static String buildPlSqlCapturedTablePredicate(OracleConnectorConfig connectorConfig, String alias, String dmlOperationCodes, String pdbPredicate) {
+        final StringBuilder predicate = new StringBuilder(512);
+        predicate.append(alias).append("OPERATION_CODE IN (").append(dmlOperationCodes).append(") ");
+        if (pdbPredicate != null) {
+            predicate.append("AND ").append(alias).append(pdbPredicate).append(' ');
+        }
+
+        final String excludedSchemas = resolveExcludedSchemaPredicate(alias + "SEG_OWNER");
+        if (excludedSchemas.length() > 0) {
+            predicate.append("AND ").append(excludedSchemas).append(' ');
+        }
+
+        predicate.append("AND NVL(").append(alias).append("TABLE_NAME, ").append(alias).append("SEG_NAME) != '")
+                .append(LogWriterFlushStrategy.LOGMNR_FLUSH_TABLE).append("' ");
+
+        final String schemaPredicate = buildSchemaPredicate(connectorConfig, alias + "SEG_OWNER");
+        if (!Strings.isNullOrEmpty(schemaPredicate)) {
+            predicate.append("AND ").append(schemaPredicate).append(' ');
+        }
+
+        final String tablePredicate = buildTablePredicate(connectorConfig, alias + "SEG_OWNER || '.' || NVL(" + alias + "TABLE_NAME, " + alias + "SEG_NAME)");
+        if (!Strings.isNullOrEmpty(tablePredicate)) {
+            predicate.append("AND ").append(tablePredicate).append(' ');
+        }
+        return predicate.toString();
+    }
+
+    private static String buildPlSqlDdlPredicate(OracleConnectorConfig connectorConfig, OracleDatabaseSchema schema, String alias, String pdbPredicate) {
+        final StringBuilder predicate = new StringBuilder(512);
+        predicate.append(alias).append("OPERATION_CODE = 5 ");
+        predicate.append("AND ").append(alias).append("USERNAME NOT IN ('SYS','SYSTEM') ");
+        predicate.append("AND ").append(alias).append("INFO NOT LIKE 'INTERNAL DDL%' ");
+        predicate.append("AND (NVL(").append(alias).append("TABLE_NAME, ").append(alias).append("SEG_NAME) IS NULL OR NVL(")
+                .append(alias).append("TABLE_NAME, ").append(alias).append("SEG_NAME) NOT LIKE 'ORA_TEMP_%') ");
+        if (pdbPredicate != null) {
+            predicate.append("AND ").append(alias).append(pdbPredicate).append(' ');
+        }
+
+        final String excludedSchemas = resolveExcludedSchemaPredicate(alias + "SEG_OWNER");
+        if (excludedSchemas.length() > 0) {
+            predicate.append("AND ").append(excludedSchemas).append(' ');
+        }
+
+        if (schema.storeOnlyCapturedTables()) {
+            final String schemaPredicate = buildSchemaPredicate(connectorConfig, alias + "SEG_OWNER");
+            if (!Strings.isNullOrEmpty(schemaPredicate)) {
+                predicate.append("AND ").append(schemaPredicate).append(' ');
+            }
+
+            final String tablePredicate = buildTablePredicate(connectorConfig, alias + "SEG_OWNER || '.' || NVL(" + alias + "TABLE_NAME, " + alias + "SEG_NAME)");
+            if (!Strings.isNullOrEmpty(tablePredicate)) {
+                predicate.append("AND ").append(tablePredicate).append(' ');
+            }
+        }
+        return predicate.toString();
     }
 
     /**
@@ -202,16 +350,20 @@ public class LogMinerQueryBuilder {
      * @return SQL predicate to filter results based on schema include/exclude configurations
      */
     private static String buildSchemaPredicate(OracleConnectorConfig connectorConfig) {
+        return buildSchemaPredicate(connectorConfig, "SEG_OWNER");
+    }
+
+    private static String buildSchemaPredicate(OracleConnectorConfig connectorConfig, String columnName) {
         StringBuilder predicate = new StringBuilder();
         if (Strings.isNullOrEmpty(connectorConfig.schemaIncludeList())) {
             if (!Strings.isNullOrEmpty(connectorConfig.schemaExcludeList())) {
                 List<Pattern> patterns = Strings.listOfRegex(connectorConfig.schemaExcludeList(), 0);
-                predicate.append("(").append(listOfPatternsToSql(patterns, "SEG_OWNER", true)).append(")");
+                predicate.append("(").append(listOfPatternsToSql(patterns, columnName, true)).append(")");
             }
         }
         else {
             List<Pattern> patterns = Strings.listOfRegex(connectorConfig.schemaIncludeList(), 0);
-            predicate.append("(").append(listOfPatternsToSql(patterns, "SEG_OWNER", false)).append(")");
+            predicate.append("(").append(listOfPatternsToSql(patterns, columnName, false)).append(")");
         }
         return predicate.toString();
     }
@@ -223,16 +375,20 @@ public class LogMinerQueryBuilder {
      * @return SQL predicate to filter results based on table include/exclude configuration
      */
     private static String buildTablePredicate(OracleConnectorConfig connectorConfig) {
+        return buildTablePredicate(connectorConfig, "SEG_OWNER || '.' || TABLE_NAME");
+    }
+
+    private static String buildTablePredicate(OracleConnectorConfig connectorConfig, String columnName) {
         StringBuilder predicate = new StringBuilder();
         if (Strings.isNullOrEmpty(connectorConfig.tableIncludeList())) {
             if (!Strings.isNullOrEmpty(connectorConfig.tableExcludeList())) {
                 List<Pattern> patterns = Strings.listOfRegex(connectorConfig.tableExcludeList(), 0);
-                predicate.append("(").append(listOfPatternsToSql(patterns, "SEG_OWNER || '.' || TABLE_NAME", true)).append(")");
+                predicate.append("(").append(listOfPatternsToSql(patterns, columnName, true)).append(")");
             }
         }
         else {
             List<Pattern> patterns = Strings.listOfRegex(connectorConfig.tableIncludeList(), 0);
-            predicate.append("(").append(listOfPatternsToSql(patterns, "SEG_OWNER || '.' || TABLE_NAME", false)).append(")");
+            predicate.append("(").append(listOfPatternsToSql(patterns, columnName, false)).append(")");
         }
         return predicate.toString();
     }

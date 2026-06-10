@@ -15,19 +15,20 @@ import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeFormatterBuilder;
+import java.time.temporal.ChronoField;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.Map;
+import java.util.Set;
 import java.util.function.Supplier;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
-import oracle.jdbc.OracleCallableStatement;
-import oracle.jdbc.OracleTypes;
 
 import io.debezium.DebeziumException;
 import io.debezium.connector.oracle.OracleConnection;
@@ -61,6 +62,9 @@ import io.debezium.relational.TableId;
 import io.debezium.util.Clock;
 import io.debezium.util.Strings;
 
+import oracle.jdbc.OracleCallableStatement;
+import oracle.jdbc.OracleTypes;
+
 /**
  * An abstract implementation of {@link LogMinerEventProcessor} that all processors should extend.
  *
@@ -70,11 +74,18 @@ public abstract class AbstractLogMinerEventProcessor<T extends AbstractTransacti
 
     private static final Logger LOGGER = LoggerFactory.getLogger(AbstractLogMinerEventProcessor.class);
     private static final String NO_SEQUENCE_TRX_ID_SUFFIX = "ffffffff";
-    private static final DateTimeFormatter PLSQL_OUTPUT_TIMESTAMP_FORMAT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
+    private static final String PLSQL_OUTPUT_ROW_PREFIX = "@ROW|";
+    private static final String PLSQL_OUTPUT_END_PREFIX = "@END|";
+    private static final DateTimeFormatter PLSQL_OUTPUT_TIMESTAMP_FORMAT = new DateTimeFormatterBuilder()
+            .appendPattern("yyyy-MM-dd HH:mm:ss")
+            .optionalStart()
+            .appendFraction(ChronoField.NANO_OF_SECOND, 1, 9, true)
+            .optionalEnd()
+            .toFormatter();
     private static final Duration PLSQL_OUTPUT_IDLE_LOG_INTERVAL = Duration.ofSeconds(30);
     private static final Duration PLSQL_OUTPUT_READ_PROGRESS_LOG_INTERVAL = Duration.ofSeconds(15);
-    private static final int PLSQL_OUTPUT_GET_LINES_BATCH_SIZE = 1000;
-    private static final int[] PLSQL_OUTPUT_GET_LINES_LINE_LENGTHS = { 32760, 32000, 16000, 8000, 4000 };
+    private static final int PLSQL_OUTPUT_GET_LINES_BATCH_SIZE = 500;
+    private static final int[] PLSQL_OUTPUT_GET_LINES_LINE_LENGTHS = { 8000, 4000 };
     private static final int PLSQL_OUTPUT_LOG_PREVIEW_LENGTH = 512;
     private static final int PLSQL_OUTPUT_SAMPLE_LIMIT = 5;
 
@@ -249,13 +260,13 @@ public abstract class AbstractLogMinerEventProcessor<T extends AbstractTransacti
             statement.setString(2, endScn.toString());
 
             Instant queryStart = Instant.now();
-            LOGGER.info("PL/SQL output LogMiner executing DBMS_OUTPUT query block: scnRange=[{}, {}], offsetScn={}, offsetCommitScn={}, activeTransactions={}",
+            LOGGER.debug("PL/SQL output LogMiner executing DBMS_OUTPUT query block: scnRange=[{}, {}], offsetScn={}, offsetCommitScn={}, activeTransactions={}",
                     startScn, endScn, offsetContext.getScn(), offsetContext.getCommitScn(),
                     metrics.getNumberOfActiveTransactions());
             statement.execute();
             Duration queryDuration = Duration.between(queryStart, Instant.now());
             metrics.setLastDurationOfBatchCapturing(queryDuration);
-            LOGGER.info("PL/SQL output LogMiner DBMS_OUTPUT query block finished in {} ms: scnRange=[{}, {}]",
+            LOGGER.debug("PL/SQL output LogMiner DBMS_OUTPUT query block finished in {} ms: scnRange=[{}, {}]",
                     queryDuration.toMillis(), startScn, endScn);
 
             Instant startProcessTime = Instant.now();
@@ -263,11 +274,11 @@ public abstract class AbstractLogMinerEventProcessor<T extends AbstractTransacti
             int dmlBefore = counters.dmlCount;
             int commitBefore = counters.commitCount;
             int rollbackBefore = counters.rollbackCount;
-            LOGGER.info("PL/SQL output LogMiner reading DBMS_OUTPUT rows: scnRange=[{}, {}]", startScn, endScn);
-            PlSqlOutputReadStats readStats = processPlSqlOutputRows(partition, statement);
-            LOGGER.info("PL/SQL output LogMiner DBMS_OUTPUT rows read: scnRange=[{}, {}], outputLines={}, outputFetches={}, outputRows={}, completedRows={}, operations={}, lastRow={}",
+            PlSqlOutputReadStats readStats = processPlSqlOutputRows(partition, statement, startScn, endScn);
+            LOGGER.debug(
+                    "PL/SQL output LogMiner DBMS_OUTPUT rows read: scnRange=[{}, {}], outputLines={}, outputFetches={}, outputRows={}, completedRows={}, truncated={}, effectiveEndScn={}, operations={}, lastRow={}",
                     startScn, endScn, readStats.outputLines, readStats.outputFetches, readStats.outputRows, readStats.completedRows,
-                    readStats.describeOperationCounts(), readStats.describeLastRow());
+                    readStats.truncated, readStats.getEffectiveEndScn(endScn), readStats.describeOperationCounts(), readStats.describeLastRow());
 
             Duration totalTime = Duration.between(startProcessTime, Instant.now());
             metrics.setLastCapturedDmlCount(counters.dmlCount);
@@ -293,15 +304,26 @@ public abstract class AbstractLogMinerEventProcessor<T extends AbstractTransacti
                     offsetContext.getCommitScn(), metrics.getNumberOfActiveTransactions(),
                     metrics.getMillisecondToSleepBetweenMiningQuery());
 
-            metrics.addProcessedRows(counters.rows);
-            return calculateNewStartScn(endScn, offsetContext.getCommitScn().getMaxCommittedScn());
+            metrics.addProcessedRows(counters.rows - rowsBefore);
+            if (readStats.outputRows == 0 && !readStats.truncated && getTransactionCache().isEmpty()) {
+                offsetContext.setScn(endScn);
+                metrics.setOldestScn(endScn);
+                metrics.setOffsetScn(endScn);
+                dispatcher.dispatchHeartbeatEvent(partition, offsetContext);
+                LOGGER.info("PL/SQL output LogMiner advanced empty window: scnRange=[{}, {}], offsetScn={}, activeTransactions=0",
+                        startScn, endScn, offsetContext.getScn());
+                return endScn;
+            }
+            final Scn effectiveEndScn = readStats.getEffectiveEndScn(endScn);
+            return calculateNewStartScn(effectiveEndScn, offsetContext.getCommitScn().getMaxCommittedScn());
         }
     }
 
     private void maybeLogPlSqlOutputPolling(Scn startScn, Scn endScn) {
         final Instant now = Instant.now();
         if (Duration.between(lastPlSqlOutputActivityLogTime, now).compareTo(PLSQL_OUTPUT_IDLE_LOG_INTERVAL) >= 0) {
-            LOGGER.info("PL/SQL output LogMiner polling: scnRange=[{}, {}], emptyBatchesSinceLastLog={}, offsetScn={}, offsetCommitScn={}, activeTransactions={}, sleepMs={}",
+            LOGGER.info(
+                    "PL/SQL output LogMiner polling: scnRange=[{}, {}], emptyBatchesSinceLastLog={}, offsetScn={}, offsetCommitScn={}, activeTransactions={}, sleepMs={}",
                     startScn, endScn, plSqlOutputEmptyBatchCount, offsetContext.getScn(), offsetContext.getCommitScn(),
                     metrics.getNumberOfActiveTransactions(), metrics.getMillisecondToSleepBetweenMiningQuery());
             lastPlSqlOutputActivityLogTime = now;
@@ -312,9 +334,12 @@ public abstract class AbstractLogMinerEventProcessor<T extends AbstractTransacti
     private void logPlSqlOutputBatch(Scn startScn, Scn endScn, Duration queryDuration, Duration processDuration,
                                      PlSqlOutputReadStats readStats, long outputRows, int dmlCount,
                                      int commitCount, int rollbackCount) {
-        if (outputRows > 0 || dmlCount > 0 || commitCount > 0 || rollbackCount > 0) {
-            LOGGER.info("PL/SQL output LogMiner batch: scnRange=[{}, {}], outputLines={}, outputFetches={}, outputRows={}, completedRows={}, dml={}, commits={}, rollbacks={}, operations={}, queryMs={}, processMs={}, lastRow={}, offsetScn={}, offsetCommitScn={}, activeTransactions={}",
-                    startScn, endScn, readStats.outputLines, readStats.outputFetches, outputRows, readStats.completedRows, dmlCount, commitCount, rollbackCount,
+        // Foreign-transaction commit rows arrive every cycle; only log batches with captured work or a truncation.
+        if (dmlCount > 0 || commitCount > 0 || rollbackCount > 0 || readStats.truncated) {
+            LOGGER.info(
+                    "PL/SQL output LogMiner batch: scnRange=[{}, {}], effectiveEndScn={}, truncated={}, outputLines={}, outputFetches={}, outputRows={}, completedRows={}, dml={}, commits={}, rollbacks={}, operations={}, queryMs={}, processMs={}, lastRow={}, offsetScn={}, offsetCommitScn={}, activeTransactions={}",
+                    startScn, endScn, readStats.getEffectiveEndScn(endScn), readStats.truncated,
+                    readStats.outputLines, readStats.outputFetches, outputRows, readStats.completedRows, dmlCount, commitCount, rollbackCount,
                     readStats.describeOperationCounts(), queryDuration.toMillis(), processDuration.toMillis(), readStats.describeLastRow(),
                     offsetContext.getScn(), offsetContext.getCommitScn(), metrics.getNumberOfActiveTransactions());
             lastPlSqlOutputActivityLogTime = Instant.now();
@@ -325,10 +350,13 @@ public abstract class AbstractLogMinerEventProcessor<T extends AbstractTransacti
         }
     }
 
-    private PlSqlOutputReadStats processPlSqlOutputRows(OraclePartition partition, PreparedStatement queryStatement) throws SQLException, InterruptedException {
+    private PlSqlOutputReadStats processPlSqlOutputRows(OraclePartition partition, PreparedStatement queryStatement, Scn startScn, Scn endScn)
+            throws SQLException, InterruptedException {
         PlSqlOutputReadStats stats = new PlSqlOutputReadStats();
         try (DbmsOutputLineReader reader = new DbmsOutputLineReader(queryStatement)) {
             PlSqlOutputRowBuilder current = null;
+            Set<String> newTransactionsInBatch = new HashSet<>();
+            Set<String> replayResetTransactions = new HashSet<>();
             Instant lastProgressLogTime = Instant.now();
             while (context.isRunning()) {
                 DbmsOutputLine header = reader.readLine();
@@ -337,7 +365,16 @@ public abstract class AbstractLogMinerEventProcessor<T extends AbstractTransacti
                 if (header.status != 0) {
                     break;
                 }
-                if (Strings.isNullOrBlank(header.value) || !header.value.startsWith("@ROW|")) {
+                if (!Strings.isNullOrBlank(header.value) && header.value.startsWith(PLSQL_OUTPUT_END_PREFIX)) {
+                    if (current != null) {
+                        stats.flushedPartialRow = true;
+                        throw new DebeziumException("DBMS_OUTPUT LogMiner end marker encountered before SQL_REDO continuation completed. lastRow=" +
+                                stats.describeLastRow());
+                    }
+                    parsePlSqlOutputEnd(header.value, stats, startScn, endScn);
+                    break;
+                }
+                if (Strings.isNullOrBlank(header.value) || !header.value.startsWith(PLSQL_OUTPUT_ROW_PREFIX)) {
                     throw new DebeziumException("Bad DBMS_OUTPUT LogMiner row header: " + logPreview(header.value));
                 }
 
@@ -359,8 +396,9 @@ public abstract class AbstractLogMinerEventProcessor<T extends AbstractTransacti
                 counters.rows++;
                 stats.outputRows++;
                 stats.remember(row);
-                if (stats.shouldLogSample(row)) {
-                    LOGGER.info("PL/SQL output LogMiner sample row: scn={}, operationCode={}, operation={}, owner={}, table={}, transactionId={}, csf={}, status={}, rollback={}, sqlRedo={}",
+                if (LOGGER.isDebugEnabled() && stats.shouldLogSample(row)) {
+                    LOGGER.debug(
+                            "PL/SQL output LogMiner sample row: scn={}, operationCode={}, operation={}, owner={}, table={}, transactionId={}, csf={}, status={}, rollback={}, sqlRedo={}",
                             row.scn, row.operationCode, row.operation, row.tablespaceName, row.tableName, row.transactionId, row.csf, row.status,
                             row.rollbackFlag, logPreview(row.sqlRedo));
                 }
@@ -373,26 +411,64 @@ public abstract class AbstractLogMinerEventProcessor<T extends AbstractTransacti
                 }
 
                 if (row.csf == 0) {
-                    processRow(partition, current.build(getConfig().getCatalogName()));
+                    LogMinerEventRow eventRow = current.build(getConfig().getCatalogName());
+                    resetPlSqlOutputTransactionReplayCursor(eventRow, newTransactionsInBatch, replayResetTransactions);
+                    processRow(partition, eventRow);
                     stats.completedRows++;
                     current = null;
                 }
 
                 final Instant now = Instant.now();
                 if (Duration.between(lastProgressLogTime, now).compareTo(PLSQL_OUTPUT_READ_PROGRESS_LOG_INTERVAL) >= 0) {
-                    LOGGER.info("PL/SQL output LogMiner reading progress: outputLines={}, outputFetches={}, outputRows={}, completedRows={}, operations={}, lastRow={}, activeTransactions={}",
+                    LOGGER.info(
+                            "PL/SQL output LogMiner reading progress: outputLines={}, outputFetches={}, outputRows={}, completedRows={}, operations={}, lastRow={}, activeTransactions={}",
                             stats.outputLines, stats.outputFetches, stats.outputRows, stats.completedRows,
                             stats.describeOperationCounts(), stats.describeLastRow(), metrics.getNumberOfActiveTransactions());
                     lastProgressLogTime = now;
                 }
             }
             if (current != null) {
-                processRow(partition, current.build(getConfig().getCatalogName()));
-                stats.completedRows++;
                 stats.flushedPartialRow = true;
+                throw new DebeziumException("Incomplete DBMS_OUTPUT LogMiner row detected at end of output. " +
+                        "The SQL_REDO continuation was not fully read; refusing to advance the mining offset. lastRow=" +
+                        stats.describeLastRow());
             }
         }
         return stats;
+    }
+
+    private void resetPlSqlOutputTransactionReplayCursor(LogMinerEventRow row, Set<String> newTransactionsInBatch,
+                                                         Set<String> replayResetTransactions) {
+        if (!isPlSqlOutputTransactionReplayCandidate(row)) {
+            return;
+        }
+        final AbstractTransaction transaction = getTransactionCache().get(row.getTransactionId());
+        if (transaction == null) {
+            newTransactionsInBatch.add(row.getTransactionId());
+            return;
+        }
+        if (newTransactionsInBatch.contains(row.getTransactionId())) {
+            return;
+        }
+        if (transaction.getStartScn().equals(row.getScn()) && replayResetTransactions.add(row.getTransactionId())) {
+            LOGGER.trace("PL/SQL output LogMiner transaction {} replay detected at SCN {}, resetting event cursor.",
+                    row.getTransactionId(), row.getScn());
+            transaction.start();
+        }
+    }
+
+    private boolean isPlSqlOutputTransactionReplayCandidate(LogMinerEventRow row) {
+        switch (row.getEventType()) {
+            case INSERT:
+            case UPDATE:
+            case DELETE:
+            case SELECT_LOB_LOCATOR:
+            case LOB_WRITE:
+            case LOB_ERASE:
+                return row.getTransactionId() != null;
+            default:
+                return false;
+        }
     }
 
     private PlSqlOutputRow parsePlSqlOutputRow(String line, String sqlRedo) {
@@ -418,6 +494,23 @@ public abstract class AbstractLogMinerEventProcessor<T extends AbstractTransacti
                 parseInt(parts[15]),
                 nullIfEmpty(parts[16]),
                 sqlRedo);
+    }
+
+    private void parsePlSqlOutputEnd(String line, PlSqlOutputReadStats stats, Scn startScn, Scn endScn) {
+        final String[] parts = line.split("\\|", 3);
+        if (parts.length != 3 || !"truncated".equals(parts[2])) {
+            throw new DebeziumException("Bad DBMS_OUTPUT LogMiner end marker: " + logPreview(line));
+        }
+        if (Strings.isNullOrBlank(parts[1])) {
+            throw new DebeziumException("DBMS_OUTPUT LogMiner end marker truncated before any row was completed.");
+        }
+        final Scn effectiveEndScn = Scn.valueOf(parts[1]);
+        if (effectiveEndScn.compareTo(startScn) <= 0 || effectiveEndScn.compareTo(endScn) > 0) {
+            throw new DebeziumException("DBMS_OUTPUT LogMiner end marker SCN is outside the mining window: markerScn=" +
+                    effectiveEndScn + ", scnRange=[" + startScn + ", " + endScn + "]");
+        }
+        stats.truncated = true;
+        stats.effectiveEndScn = effectiveEndScn;
     }
 
     private Instant parseTimestamp(String value) {
@@ -541,6 +634,10 @@ public abstract class AbstractLogMinerEventProcessor<T extends AbstractTransacti
     protected void handleStart(LogMinerEventRow row) {
         final String transactionId = row.getTransactionId();
         final AbstractTransaction transaction = getTransactionCache().get(transactionId);
+        if (transaction == null && OracleConnectorConfig.LogMiningStrategy.PLSQL_OUTPUT.equals(getConfig().getLogMiningStrategy())) {
+            LOGGER.trace("PL/SQL output LogMiner transaction {} START ignored until a captured DML event is seen.", transactionId);
+            return;
+        }
         if (transaction == null && !isRecentlyProcessed(transactionId)) {
             getTransactionCache().put(transactionId, createTransaction(row));
             metrics.setActiveTransactions(getTransactionCache().size());
@@ -590,10 +687,12 @@ public abstract class AbstractLogMinerEventProcessor<T extends AbstractTransacti
         int numEvents = getTransactionEventCount(transaction);
         LOGGER.trace("Commit (smallest SCN {}) {}", smallestScn, row);
         LOGGER.trace("Transaction {} has {} events", transactionId, numEvents);
-        final boolean skipExcludedUserName = isTransactionUserExcluded(transaction);
-        if (OracleConnectorConfig.LogMiningStrategy.PLSQL_OUTPUT.equals(getConfig().getLogMiningStrategy()) && numEvents > 0) {
-            LOGGER.info("PL/SQL output LogMiner committing transaction: transactionId={}, commitScn={}, events={}, smallestCachedScn={}, user={}, excludedUser={}, activeTransactions={}",
-                    transactionId, commitScn, numEvents, smallestScn, row.getUserName(), skipExcludedUserName,
+        final boolean skipExcludedUserName = isTransactionUserExcluded(transaction, row);
+        if (LOGGER.isDebugEnabled() && numEvents > 0
+                && OracleConnectorConfig.LogMiningStrategy.PLSQL_OUTPUT.equals(getConfig().getLogMiningStrategy())) {
+            LOGGER.debug(
+                    "PL/SQL output LogMiner committing transaction: transactionId={}, commitScn={}, events={}, smallestCachedScn={}, transactionUser={}, commitUser={}, excludedUser={}, activeTransactions={}",
+                    transactionId, commitScn, numEvents, smallestScn, transaction.getUserName(), row.getUserName(), skipExcludedUserName,
                     getTransactionCache().size());
         }
 
@@ -725,21 +824,25 @@ public abstract class AbstractLogMinerEventProcessor<T extends AbstractTransacti
     protected abstract void finalizeTransactionCommit(String transactionId, Scn commitScn);
 
     /**
-     * Check whether the supplied username associated with the specified transaction is excluded.
+     * Check whether the username associated with the transaction or its commit row is excluded.
      *
-     * @param transaction the transaction, never {@code null}
+     * @param transaction the transaction, may be {@code null}
+     * @param commitRow the commit event row, may be {@code null}
      * @return true if the transaction should be skipped; false if transaction should be emitted
      */
-    protected boolean isTransactionUserExcluded(T transaction) {
+    protected boolean isTransactionUserExcluded(T transaction, LogMinerEventRow commitRow) {
         if (transaction != null) {
             if (transaction.getUserName() == null && getTransactionEventCount(transaction) > 0) {
                 LOGGER.debug("Detected transaction with null username {}", transaction);
-                return false;
             }
             else if (connectorConfig.getLogMiningUsernameExcludes().contains(transaction.getUserName())) {
                 LOGGER.trace("Skipped transaction with excluded username {}", transaction);
                 return true;
             }
+        }
+        if (commitRow != null && connectorConfig.getLogMiningUsernameExcludes().contains(commitRow.getUserName())) {
+            LOGGER.trace("Skipped transaction {} with excluded commit username {}", commitRow.getTransactionId(), commitRow.getUserName());
+            return true;
         }
         return false;
     }
@@ -1049,7 +1152,8 @@ public abstract class AbstractLogMinerEventProcessor<T extends AbstractTransacti
         if (table == null) {
             if (!getConfig().getTableFilters().dataCollectionFilter().isIncluded(tableId)) {
                 if (OracleConnectorConfig.LogMiningStrategy.PLSQL_OUTPUT.equals(getConfig().getLogMiningStrategy())) {
-                    LOGGER.info("PL/SQL output LogMiner data event skipped because table filter does not include tableId={}: scn={}, operation={}, transactionId={}, sqlRedo={}",
+                    LOGGER.info(
+                            "PL/SQL output LogMiner data event skipped because table filter does not include tableId={}: scn={}, operation={}, transactionId={}, sqlRedo={}",
                             tableId, row.getScn(), row.getEventType(), row.getTransactionId(), logPreview(row.getRedoSql()));
                 }
                 return null;
@@ -1365,11 +1469,12 @@ public abstract class AbstractLogMinerEventProcessor<T extends AbstractTransacti
                     if (++lineLengthIndex >= PLSQL_OUTPUT_GET_LINES_LINE_LENGTHS.length) {
                         singleLineMode = true;
                         if (!fallbackLogged) {
-                            LOGGER.warn("PL/SQL output LogMiner DBMS_OUTPUT.GET_LINES is not supported by the Oracle JDBC driver; falling back to DBMS_OUTPUT.GET_LINE. Last error: {}",
+                            LOGGER.warn(
+                                    "PL/SQL output LogMiner DBMS_OUTPUT.GET_LINES is not supported by the Oracle JDBC driver; falling back to DBMS_OUTPUT.GET_LINE. Last error: {}",
                                     e.getMessage());
                             fallbackLogged = true;
                         }
-                        return false;
+                        return readSingleLineIntoBatch();
                     }
                     LOGGER.warn("PL/SQL output LogMiner DBMS_OUTPUT.GET_LINES line size {} rejected by Oracle JDBC driver, retrying with {}. Error: {}",
                             PLSQL_OUTPUT_GET_LINES_LINE_LENGTHS[lineLengthIndex - 1],
@@ -1396,6 +1501,20 @@ public abstract class AbstractLogMinerEventProcessor<T extends AbstractTransacti
             System.arraycopy(fetchedLines, 0, lines, 0, count);
             index = 0;
             this.fetchedLines += count;
+            return true;
+        }
+
+        private boolean readSingleLineIntoBatch() throws SQLException {
+            DbmsOutputLine line = readSingleLine();
+            if (line.status != 0) {
+                exhausted = true;
+                count = 0;
+                index = 0;
+                return false;
+            }
+            lines[0] = line.value;
+            count = 1;
+            index = 0;
             return true;
         }
 
@@ -1451,6 +1570,8 @@ public abstract class AbstractLogMinerEventProcessor<T extends AbstractTransacti
         private long outputRows;
         private long completedRows;
         private boolean flushedPartialRow;
+        private boolean truncated;
+        private Scn effectiveEndScn;
         private Scn lastScn = Scn.NULL;
         private int lastOperationCode;
         private String lastOperation;
@@ -1503,7 +1624,13 @@ public abstract class AbstractLogMinerEventProcessor<T extends AbstractTransacti
                     ", transactionId=" + lastTransactionId +
                     ", csf=" + lastCsf +
                     ", thread=" + lastThread +
+                    ", truncated=" + truncated +
+                    ", effectiveEndScn=" + effectiveEndScn +
                     ", flushedPartialRow=" + flushedPartialRow;
+        }
+
+        private Scn getEffectiveEndScn(Scn configuredEndScn) {
+            return effectiveEndScn == null ? configuredEndScn : effectiveEndScn;
         }
     }
 
