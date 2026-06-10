@@ -155,6 +155,16 @@ public class LogMinerEventRow {
         return row;
     }
 
+    public static LogMinerEventRow fromValues(String catalogName, Scn scn, String redoSql, int operationCode, Instant changeTime,
+                                              String transactionId, String tableName, String tablespaceName, String operation,
+                                              String userName, String rowId, boolean rollbackFlag, String rsId, int status,
+                                              String info, int ssn, int thread) {
+        LogMinerEventRow row = new LogMinerEventRow();
+        row.initializeFromValues(catalogName, scn, redoSql, operationCode, changeTime, transactionId, tableName, tablespaceName,
+                operation, userName, rowId, rollbackFlag, rsId, status, info, ssn, thread);
+        return row;
+    }
+
     /**
      * Initializes the instance from the JDBC {@link ResultSet}.
      *
@@ -181,6 +191,31 @@ public class LogMinerEventRow {
         this.info = resultSet.getString(INFO);
         this.ssn = resultSet.getInt(SSN);
         this.thread = resultSet.getInt(THREAD);
+        if (this.tableName != null) {
+            this.tableId = new TableId(catalogName, tablespaceName, tableName);
+        }
+    }
+
+    private void initializeFromValues(String catalogName, Scn scn, String redoSql, int operationCode, Instant changeTime,
+                                      String transactionId, String tableName, String tablespaceName, String operation,
+                                      String userName, String rowId, boolean rollbackFlag, String rsId, int status,
+                                      String info, int ssn, int thread) {
+        this.scn = scn;
+        this.redoSql = redoSql;
+        this.eventType = EventType.from(operationCode);
+        this.changeTime = changeTime;
+        this.transactionId = transactionId;
+        this.tableName = tableName;
+        this.tablespaceName = tablespaceName;
+        this.operation = operation;
+        this.userName = userName;
+        this.rowId = rowId;
+        this.rollbackFlag = rollbackFlag;
+        this.rsId = rsId;
+        this.status = status;
+        this.info = info;
+        this.ssn = ssn;
+        this.thread = thread;
         if (this.tableName != null) {
             this.tableId = new TableId(catalogName, tablespaceName, tableName);
         }

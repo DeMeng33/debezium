@@ -57,6 +57,14 @@ public class LogMinerHelper {
                                                      boolean archiveLogOnlyMode, String archiveDestinationName, int maxRetries,
                                                      Duration initialDelay, Duration maxDelay)
             throws SQLException {
+        return setLogFilesForMining(connection, lastProcessedScn, null, archiveLogRetention, archiveLogOnlyMode,
+                archiveDestinationName, maxRetries, initialDelay, maxDelay);
+    }
+
+    public static List<LogFile> setLogFilesForMining(OracleConnection connection, Scn lastProcessedScn, Scn endScn, Duration archiveLogRetention,
+                                                     boolean archiveLogOnlyMode, String archiveDestinationName, int maxRetries,
+                                                     Duration initialDelay, Duration maxDelay)
+            throws SQLException {
         removeLogFilesFromMining(connection);
 
         // Restrict max attempts to 0 or greater values (sanity-check)
@@ -69,7 +77,7 @@ public class LogMinerHelper {
         // due to Oracle performing the operation non-atomically.
         List<LogFile> logFilesForMining = new ArrayList<>();
         for (int attempt = 0; attempt <= maxAttempts; ++attempt) {
-            logFilesForMining.addAll(getLogFilesForOffsetScn(connection, lastProcessedScn, archiveLogRetention,
+            logFilesForMining.addAll(getLogFilesForOffsetScn(connection, lastProcessedScn, endScn, archiveLogRetention,
                     archiveLogOnlyMode, archiveDestinationName));
             // we don't need lastProcessedSCN in the logs, as that one was already processed, but we do want
             // the next SCN to be present, as that is where we'll start processing from.
@@ -87,7 +95,7 @@ public class LogMinerHelper {
                 executeCallableStatement(connection, addLogFileStatement);
             }
 
-            LOGGER.debug("Last mined SCN: {}, Log file list to mine: {}", lastProcessedScn, logFilesNames);
+            LOGGER.debug("Last mined SCN: {}, end SCN: {}, Log file list to mine: {}", lastProcessedScn, endScn, logFilesNames);
             return logFilesForMining;
         }
 
@@ -132,13 +140,19 @@ public class LogMinerHelper {
     public static List<LogFile> getLogFilesForOffsetScn(OracleConnection connection, Scn offsetScn, Duration archiveLogRetention,
                                                         boolean archiveLogOnlyMode, String archiveDestinationName)
             throws SQLException {
-        LOGGER.trace("Getting logs to be mined for offset scn {}", offsetScn);
+        return getLogFilesForOffsetScn(connection, offsetScn, null, archiveLogRetention, archiveLogOnlyMode, archiveDestinationName);
+    }
+
+    public static List<LogFile> getLogFilesForOffsetScn(OracleConnection connection, Scn offsetScn, Scn endScn, Duration archiveLogRetention,
+                                                        boolean archiveLogOnlyMode, String archiveDestinationName)
+            throws SQLException {
+        LOGGER.trace("Getting logs to be mined for offset scn {} and end scn {}", offsetScn, endScn);
 
         final List<LogFile> logFiles = new ArrayList<>();
         final Set<LogFile> onlineLogFiles = new LinkedHashSet<>();
         final Set<LogFile> archivedLogFiles = new LinkedHashSet<>();
 
-        connection.query(SqlUtils.allMinableLogsQuery(offsetScn, archiveLogRetention, archiveLogOnlyMode, archiveDestinationName), rs -> {
+        connection.query(SqlUtils.allMinableLogsQuery(offsetScn, endScn, archiveLogRetention, archiveLogOnlyMode, archiveDestinationName), rs -> {
             while (rs.next()) {
                 String fileName = rs.getString(1);
                 Scn firstScn = getScnFromString(rs.getString(2));

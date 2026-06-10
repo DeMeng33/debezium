@@ -22,6 +22,13 @@ import io.debezium.util.Strings;
 public class LogMinerQueryBuilder {
 
     private static final String LOGMNR_CONTENTS_VIEW = "V$LOGMNR_CONTENTS";
+    private static final String SELECT_LIST = "SELECT SCN, SQL_REDO, OPERATION_CODE, TIMESTAMP, XID, CSF, TABLE_NAME, SEG_OWNER, OPERATION, "
+            + "USERNAME, ROW_ID, ROLLBACK, RS_ID, STATUS, INFO, SSN, THREAD# "
+            + "FROM " + LOGMNR_CONTENTS_VIEW + " ";
+    private static final String PLSQL_OUTPUT_TABLE_NAME = "NVL(TABLE_NAME, SEG_NAME)";
+    private static final String PLSQL_OUTPUT_SELECT_LIST = "SELECT SCN, SQL_REDO, OPERATION_CODE, TIMESTAMP AS CHANGE_TIME, LOWER(RAWTOHEX(XID)) AS XID_HEX, "
+            + "CSF, " + PLSQL_OUTPUT_TABLE_NAME + " AS TABLE_NAME, SEG_OWNER, OPERATION, USERNAME, ROW_ID, ROLLBACK AS ROLLBACK_FLAG, RS_ID, STATUS, INFO, SSN, THREAD# AS THREAD_NUMBER "
+            + "FROM " + LOGMNR_CONTENTS_VIEW + " ";
 
     /**
      * Builds the LogMiner contents view query.
@@ -53,9 +60,7 @@ public class LogMinerQueryBuilder {
      */
     public static String build(OracleConnectorConfig connectorConfig, OracleDatabaseSchema schema) {
         final StringBuilder query = new StringBuilder(1024);
-        query.append("SELECT SCN, SQL_REDO, OPERATION_CODE, TIMESTAMP, XID, CSF, TABLE_NAME, SEG_OWNER, OPERATION, ");
-        query.append("USERNAME, ROW_ID, ROLLBACK, RS_ID, STATUS, INFO, SSN, THREAD# ");
-        query.append("FROM ").append(LOGMNR_CONTENTS_VIEW).append(" ");
+        query.append(SELECT_LIST);
 
         // These bind parameters will be bound when the query is executed by the caller.
         query.append("WHERE SCN > ? AND SCN <= ? ");
@@ -146,6 +151,29 @@ public class LogMinerQueryBuilder {
         query.append("))");
 
         return query.toString();
+    }
+
+    public static String buildPlSqlOutputBlock(OracleConnectorConfig connectorConfig, OracleDatabaseSchema schema) {
+        final String query = build(connectorConfig, schema)
+                .replace(SELECT_LIST, PLSQL_OUTPUT_SELECT_LIST)
+                .replace("TABLE_NAME != '" + LogWriterFlushStrategy.LOGMNR_FLUSH_TABLE + "'", PLSQL_OUTPUT_TABLE_NAME + " != '" + LogWriterFlushStrategy.LOGMNR_FLUSH_TABLE + "'")
+                .replace("TABLE_NAME IS NULL OR TABLE_NAME NOT LIKE 'ORA_TEMP_%'", PLSQL_OUTPUT_TABLE_NAME + " IS NULL OR " + PLSQL_OUTPUT_TABLE_NAME + " NOT LIKE 'ORA_TEMP_%'")
+                .replace("SEG_OWNER || '.' || TABLE_NAME", "SEG_OWNER || '.' || " + PLSQL_OUTPUT_TABLE_NAME);
+
+        return "BEGIN " +
+                "DBMS_OUTPUT.DISABLE; " +
+                "DBMS_OUTPUT.ENABLE(NULL); " +
+                "FOR r IN (" + query + " ORDER BY SCN, RS_ID, SSN) LOOP " +
+                "DBMS_OUTPUT.PUT_LINE('@ROW|' || TO_CHAR(r.SCN) || '|' || TO_CHAR(r.OPERATION_CODE) || '|' || " +
+                "TO_CHAR(r.CHANGE_TIME, 'YYYY-MM-DD HH24:MI:SS') || '|' || NVL(r.XID_HEX, '') || '|' || " +
+                "TO_CHAR(NVL(r.CSF, 0)) || '|' || NVL(r.TABLE_NAME, '') || '|' || NVL(r.SEG_OWNER, '') || '|' || " +
+                "NVL(r.OPERATION, '') || '|' || NVL(r.USERNAME, '') || '|' || NVL(r.ROW_ID, '') || '|' || " +
+                "TO_CHAR(NVL(r.ROLLBACK_FLAG, 0)) || '|' || NVL(r.RS_ID, '') || '|' || TO_CHAR(NVL(r.STATUS, 0)) || '|' || " +
+                "TO_CHAR(NVL(r.SSN, 0)) || '|' || TO_CHAR(NVL(r.THREAD_NUMBER, 0)) || '|' || " +
+                "NVL(REPLACE(REPLACE(r.INFO, CHR(13), ' '), CHR(10), ' '), '')); " +
+                "DBMS_OUTPUT.PUT_LINE(r.SQL_REDO); " +
+                "END LOOP; " +
+                "END;";
     }
 
     /**

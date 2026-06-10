@@ -257,7 +257,13 @@ public class MemoryLogMinerEventProcessor extends AbstractLogMinerEventProcessor
 
     @Override
     protected PreparedStatement createQueryStatement() throws SQLException {
-        final String query = LogMinerQueryBuilder.build(getConfig(), getSchema());
+        final boolean plSqlOutput = OracleConnectorConfig.LogMiningStrategy.PLSQL_OUTPUT.equals(getConfig().getLogMiningStrategy());
+        final String query = plSqlOutput
+                ? LogMinerQueryBuilder.buildPlSqlOutputBlock(getConfig(), getSchema())
+                : LogMinerQueryBuilder.build(getConfig(), getSchema());
+        if (plSqlOutput) {
+            LOGGER.info("Creating PL/SQL output LogMiner statement using memory buffer.");
+        }
         return jdbcConnection.connection().prepareStatement(query,
                 ResultSet.TYPE_FORWARD_ONLY,
                 ResultSet.CONCUR_READ_ONLY,

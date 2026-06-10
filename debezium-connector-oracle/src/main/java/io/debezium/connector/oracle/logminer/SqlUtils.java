@@ -92,12 +92,13 @@ public class SqlUtils {
      * Obtain a query to fetch all available minable logs, both archive and online redo logs.
      *
      * @param scn oldest system change number to search by
+     * @param endScn highest system change number to search by, may be {@code null}
      * @param archiveLogRetention duration archive logs will be mined
      * @param archiveLogOnlyMode true if to only mine archive logs, false to mine all available logs
      * @param archiveDestinationName configured archive log destination to use, may be {@code null}
      * @return the query string to obtain minable log files
      */
-    public static String allMinableLogsQuery(Scn scn, Duration archiveLogRetention, boolean archiveLogOnlyMode, String archiveDestinationName) {
+    public static String allMinableLogsQuery(Scn scn, Scn endScn, Duration archiveLogRetention, boolean archiveLogOnlyMode, String archiveDestinationName) {
         // The generated query performs a union in order to obtain a list of all archive logs that should be mined
         // combined with a list of redo logs that should be mined.
         //
@@ -161,6 +162,9 @@ public class SqlUtils {
         sb.append("AND A.ARCHIVED = 'YES' ");
         sb.append("AND A.STATUS = 'A' ");
         sb.append("AND A.NEXT_CHANGE# > ").append(scn).append(" ");
+        if (endScn != null && !endScn.isNull()) {
+            sb.append("AND A.FIRST_CHANGE# <= ").append(endScn).append(" ");
+        }
         sb.append("AND A.DEST_ID IN (").append(localArchiveLogDestinationsOnlyQuery(archiveDestinationName)).append(") ");
 
         if (!archiveLogRetention.isNegative() && !archiveLogRetention.isZero()) {

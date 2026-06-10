@@ -159,7 +159,8 @@ public class OracleConnectorConfig extends HistorizedRelationalDatabaseConnector
             .withWidth(Width.MEDIUM)
             .withImportance(Importance.HIGH)
             .withGroup(Field.createGroupEntry(Field.Group.CONNECTION_ADVANCED, 8))
-            .withDescription("There are strategies: Online catalog with faster mining but no captured DDL. Another - with data dictionary loaded into REDO LOG files");
+            .withDescription("There are strategies: Online catalog with faster mining but no captured DDL. Another - with data dictionary loaded into REDO LOG files. "
+                    + "PL/SQL output uses online catalog and reads LogMiner rows through DBMS_OUTPUT.");
 
     // this option could be true up to Oracle 18c version. Starting from Oracle 19c this option cannot be true todo should we do it?
     public static final Field CONTINUOUS_MINE = Field.create("log.mining.continuous.mine")
@@ -1098,7 +1099,14 @@ public class OracleConnectorConfig extends HistorizedRelationalDatabaseConnector
          * This option does not use CONTINUOUS_MINE option
          * This is default value
          */
-        CATALOG_IN_REDO("redo_log_catalog");
+        CATALOG_IN_REDO("redo_log_catalog"),
+
+        /**
+         * This strategy uses LogMiner with the online catalog and fetches LogMiner contents via a PL/SQL
+         * DBMS_OUTPUT loop. This is intended for environments where direct JDBC result set fetching from
+         * V$LOGMNR_CONTENTS is unreliable.
+         */
+        PLSQL_OUTPUT("plsql_output");
 
         private final String value;
 
