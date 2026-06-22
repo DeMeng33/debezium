@@ -9,7 +9,10 @@ import static org.fest.assertions.Assertions.assertThat;
 
 import java.math.BigDecimal;
 import java.math.BigInteger;
+import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
 
@@ -69,5 +72,70 @@ public class LogMinerUtilsTest {
                         .toMap(Map.Entry::getKey, e -> new BigDecimal(e.getValue()).longValue() == -1 ? Long.MAX_VALUE : new BigInteger(e.getValue()).longValue()));
 
         assertThat(res).isNotEmpty();
+    }
+
+    @Test
+    public void shouldDetectLogFilesCoveringMiningRange() {
+        List<LogFile> logs = Arrays.asList(
+                archivedLog("log1", 100, 200, 1, 1),
+                archivedLog("log2", 200, 300, 2, 1));
+
+        assertThat(LogMinerHelper.hasLogFilesCoveringScnRange(logs, Scn.valueOf(101), Scn.valueOf(250))).isTrue();
+    }
+
+    @Test
+    public void shouldDetectMissingCoverageGapBeforeEndScn() {
+        List<LogFile> logs = Arrays.asList(
+                archivedLog("log1", 100, 150, 1, 1),
+                archivedLog("log2", 200, 300, 2, 1));
+
+        assertThat(LogMinerHelper.hasLogFilesCoveringScnRange(logs, Scn.valueOf(101), Scn.valueOf(250))).isFalse();
+    }
+
+    @Test
+    public void shouldRequireAtLeastOneThreadToCoverMiningStartScn() {
+        List<LogFile> logs = Collections.singletonList(archivedLog("log1", 200, 300, 1, 1));
+
+        assertThat(LogMinerHelper.hasLogFilesCoveringScnRange(logs, Scn.valueOf(101), Scn.valueOf(250))).isFalse();
+    }
+
+    @Test
+    public void shouldIgnoreEndCoverageWhenEndScnIsNull() {
+        List<LogFile> logs = Collections.singletonList(archivedLog("log1", 100, 150, 1, 1));
+
+        assertThat(LogMinerHelper.hasLogFilesCoveringScnRange(logs, Scn.valueOf(101), null)).isTrue();
+    }
+
+    @Test
+    public void shouldValidateEachRacThreadThatCoversMiningStartScn() {
+        List<LogFile> logs = Arrays.asList(
+                archivedLog("thread1-log1", 100, 200, 1, 1),
+                archivedLog("thread1-log2", 200, 300, 2, 1),
+                archivedLog("thread2-log1", 100, 150, 1, 2),
+                archivedLog("thread2-log2", 200, 300, 2, 2));
+
+        assertThat(LogMinerHelper.hasLogFilesCoveringScnRange(logs, Scn.valueOf(101), Scn.valueOf(250))).isFalse();
+    }
+
+    @Test
+    public void shouldAcceptRacThreadThatStartsAfterMiningStartScn() {
+        List<LogFile> logs = Arrays.asList(
+                archivedLog("thread1-log1", 100, 200, 1, 1),
+                archivedLog("thread1-log2", 200, 300, 2, 1),
+                archivedLog("thread2-log1", 180, 300, 1, 2));
+
+        assertThat(LogMinerHelper.hasLogFilesCoveringScnRange(logs, Scn.valueOf(101), Scn.valueOf(250))).isTrue();
+    }
+
+    @Test
+    public void shouldTreatCurrentOnlineRedoLogAsCoveringEndScn() {
+        List<LogFile> logs = Collections.singletonList(
+                new LogFile("redo-current", Scn.valueOf(100), Scn.valueOf(150), BigInteger.ONE, LogFile.Type.REDO, true, 1));
+
+        assertThat(LogMinerHelper.hasLogFilesCoveringScnRange(logs, Scn.valueOf(101), Scn.valueOf(250))).isTrue();
+    }
+
+    private static LogFile archivedLog(String fileName, int firstScn, int nextScn, int sequence, int thread) {
+        return new LogFile(fileName, Scn.valueOf(firstScn), Scn.valueOf(nextScn), BigInteger.valueOf(sequence), LogFile.Type.ARCHIVE, thread);
     }
 }

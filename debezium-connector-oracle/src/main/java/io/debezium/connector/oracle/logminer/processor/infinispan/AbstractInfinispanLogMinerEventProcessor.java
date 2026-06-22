@@ -9,8 +9,13 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.time.Duration;
+import java.time.Instant;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
 
@@ -47,6 +52,11 @@ public abstract class AbstractInfinispanLogMinerEventProcessor extends AbstractL
     private final OraclePartition partition;
     private final OracleOffsetContext offsetContext;
     private final EventDispatcher<OraclePartition, TableId> dispatcher;
+    private final Map<String, MissingTransactionObservation> missingTransactionsCache = new HashMap<>();
+    private final Set<String> abandonedTransactionsCache = new HashSet<>();
+
+    private static final int MISSING_TRANSACTION_CONFIRMATIONS_TO_ABANDON = 2;
+    private static final Duration MISSING_TRANSACTION_CHECK_INTERVAL = Duration.ofSeconds(30);
 
     public AbstractInfinispanLogMinerEventProcessor(ChangeEventSourceContext context,
                                                     OracleConnectorConfig connectorConfig,
@@ -147,6 +157,116 @@ public abstract class AbstractInfinispanLogMinerEventProcessor extends AbstractL
     }
 
     @Override
+    protected void abandonTransactionsAfterEmptyPlSqlOutputWindow(Scn endScn) throws InterruptedException {
+        abandonTransactions(getConfig().getLogMiningTransactionRetention());
+        abandonTransactionsMissingFromDatabase(endScn);
+    }
+
+    private void abandonTransactionsMissingFromDatabase(Scn endScn) {
+        missingTransactionsCache.keySet().removeIf(transactionId -> !getTransactionCache().containsKey(transactionId));
+
+        for (String transactionId : new HashSet<>(getTransactionCache().keySet())) {
+            final InfinispanTransaction transaction = getTransactionCache().get(transactionId);
+            if (transaction == null) {
+                continue;
+            }
+
+            final MissingTransactionObservation observation = missingTransactionsCache.get(transactionId);
+            if (observation != null && !shouldCheckMissingTransaction(endScn, observation)) {
+                LOGGER.debug(
+                        "PL/SQL output LogMiner keeping cached Infinispan transaction {} while waiting to re-check V$TRANSACTION: startScn={}, endScn={}, missingObservedAtCurrentScn={}, confirmations={}",
+                        transactionId, transaction.getStartScn(), endScn, observation.getObservedAtCurrentScn(), observation.getConfirmations());
+                continue;
+            }
+
+            if (isTransactionActiveInDatabase(transactionId)) {
+                missingTransactionsCache.remove(transactionId);
+                continue;
+            }
+
+            final MissingTransactionObservation updatedObservation = recordMissingTransactionObservation(transactionId, transaction, endScn, observation);
+            if (updatedObservation.canAbandonAt(endScn)) {
+                LOGGER.warn(
+                        "PL/SQL output LogMiner abandoning stale cached Infinispan transaction {} after repeated V$TRANSACTION misses and mined SCN watermark: startScn={}, events={}, endScn={}, missingObservedAtCurrentScn={}, confirmations={}",
+                        transactionId, transaction.getStartScn(), getTransactionEventCount(transaction), endScn,
+                        updatedObservation.getObservedAtCurrentScn(), updatedObservation.getConfirmations());
+                removeEventsWithTransaction(transaction);
+                getTransactionCache().remove(transactionId);
+                missingTransactionsCache.remove(transactionId);
+                abandonedTransactionsCache.add(transactionId);
+                metrics.addAbandonedTransactionId(transactionId);
+                metrics.setActiveTransactions(getTransactionCache().size());
+            }
+        }
+
+        final Scn smallestScn = getTransactionCacheMinimumScn();
+        metrics.setOldestScn(smallestScn.isNull() ? Scn.valueOf(-1) : smallestScn);
+    }
+
+    private boolean shouldCheckMissingTransaction(Scn endScn, MissingTransactionObservation observation) {
+        if (observation.hasBeenMinedThrough(endScn)) {
+            return true;
+        }
+        return Duration.between(observation.getLastCheckedAt(), Instant.now()).compareTo(MISSING_TRANSACTION_CHECK_INTERVAL) >= 0;
+    }
+
+    private MissingTransactionObservation recordMissingTransactionObservation(String transactionId, InfinispanTransaction transaction,
+                                                                             Scn endScn, MissingTransactionObservation observation) {
+        final Instant now = Instant.now();
+        if (observation == null) {
+            final Scn currentScn = getCurrentScnForMissingTransaction(transactionId);
+            final MissingTransactionObservation newObservation = new MissingTransactionObservation(currentScn, now);
+            missingTransactionsCache.put(transactionId, newObservation);
+            LOGGER.info(
+                    "PL/SQL output LogMiner observed cached Infinispan transaction {} missing from V$TRANSACTION; keeping until mined through observed database SCN. startScn={}, events={}, endScn={}, missingObservedAtCurrentScn={}, confirmations={}",
+                    transactionId, transaction.getStartScn(), getTransactionEventCount(transaction), endScn, currentScn, newObservation.getConfirmations());
+            return newObservation;
+        }
+        if (observation.getObservedAtCurrentScn().isNull()) {
+            final Scn currentScn = getCurrentScnForMissingTransaction(transactionId);
+            final MissingTransactionObservation newObservation = new MissingTransactionObservation(currentScn, now);
+            missingTransactionsCache.put(transactionId, newObservation);
+            LOGGER.info(
+                    "PL/SQL output LogMiner refreshed missing Infinispan transaction {} database SCN watermark after an earlier current SCN lookup failure. startScn={}, events={}, endScn={}, missingObservedAtCurrentScn={}, confirmations={}",
+                    transactionId, transaction.getStartScn(), getTransactionEventCount(transaction), endScn, currentScn, newObservation.getConfirmations());
+            return newObservation;
+        }
+
+        observation.confirm(now);
+        LOGGER.info(
+                "PL/SQL output LogMiner confirmed cached Infinispan transaction {} still missing from V$TRANSACTION. startScn={}, events={}, endScn={}, missingObservedAtCurrentScn={}, confirmations={}, minedThroughObservedScn={}",
+                transactionId, transaction.getStartScn(), getTransactionEventCount(transaction), endScn,
+                observation.getObservedAtCurrentScn(), observation.getConfirmations(), observation.hasBeenMinedThrough(endScn));
+        return observation;
+    }
+
+    private Scn getCurrentScnForMissingTransaction(String transactionId) {
+        try {
+            return jdbcConnection.getCurrentScn();
+        }
+        catch (SQLException e) {
+            LOGGER.warn("Unable to read current SCN while checking missing Infinispan transaction {}; using NULL watermark and keeping it in cache.", transactionId, e);
+            metrics.incrementWarningCount();
+            return Scn.NULL;
+        }
+    }
+
+    private boolean isTransactionActiveInDatabase(String transactionId) {
+        try (PreparedStatement statement = jdbcConnection.connection().prepareStatement(
+                "SELECT COUNT(1) FROM V$TRANSACTION WHERE RAWTOHEX(XID) = UPPER(?)")) {
+            statement.setString(1, transactionId);
+            try (ResultSet rs = statement.executeQuery()) {
+                return rs.next() && rs.getInt(1) > 0;
+            }
+        }
+        catch (SQLException e) {
+            LOGGER.warn("Unable to check whether Infinispan transaction {} is active in V$TRANSACTION; keeping it in cache.", transactionId, e);
+            metrics.incrementWarningCount();
+            return true;
+        }
+    }
+
+    @Override
     protected boolean hasSchemaChangeBeenSeen(LogMinerEventRow row) {
         return getSchemaChangesCache().containsKey(row.getScn().toString());
     }
@@ -163,6 +283,7 @@ public abstract class AbstractInfinispanLogMinerEventProcessor extends AbstractL
         if (transaction != null) {
             getTransactionCache().remove(transactionId);
         }
+        missingTransactionsCache.remove(transactionId);
         return transaction;
     }
 
@@ -170,6 +291,8 @@ public abstract class AbstractInfinispanLogMinerEventProcessor extends AbstractL
     protected void removeTransactionAndEventsFromCache(InfinispanTransaction transaction) {
         removeEventsWithTransaction(transaction);
         getTransactionCache().remove(transaction.getTransactionId());
+        missingTransactionsCache.remove(transaction.getTransactionId());
+        abandonedTransactionsCache.remove(transaction.getTransactionId());
     }
 
     @Override
@@ -220,6 +343,8 @@ public abstract class AbstractInfinispanLogMinerEventProcessor extends AbstractL
             removeEventsWithTransaction(transaction);
             getTransactionCache().remove(transactionId);
         }
+        missingTransactionsCache.remove(transactionId);
+        abandonedTransactionsCache.remove(transactionId);
         getProcessedTransactionsCache().put(transactionId, rollbackScn.toString());
     }
 
@@ -233,12 +358,17 @@ public abstract class AbstractInfinispanLogMinerEventProcessor extends AbstractL
 
     @Override
     protected void addToTransaction(String transactionId, LogMinerEventRow row, Supplier<LogMinerEvent> eventSupplier) {
+        if (abandonedTransactionsCache.contains(transactionId)) {
+            LOGGER.warn("Event for abandoned Infinispan transaction {}, skipped.", transactionId);
+            return;
+        }
         if (!isRecentlyProcessed(transactionId)) {
             InfinispanTransaction transaction = getTransactionCache().get(transactionId);
             if (transaction == null) {
                 LOGGER.trace("Transaction {} is not in cache, creating.", transactionId);
                 transaction = createTransaction(row);
             }
+            missingTransactionsCache.remove(transactionId);
             String eventKey = transaction.getEventId(transaction.getNextEventId());
             if (!getEventCache().containsKey(eventKey)) {
                 // Add new event at eventId offset
@@ -331,6 +461,43 @@ public abstract class AbstractInfinispanLogMinerEventProcessor extends AbstractL
         // Clear the event queue for the transaction
         for (int i = 0; i < transaction.getNumberOfEvents(); ++i) {
             getEventCache().remove(transaction.getEventId(i));
+        }
+    }
+
+    private static class MissingTransactionObservation {
+        private final Scn observedAtCurrentScn;
+        private int confirmations;
+        private Instant lastCheckedAt;
+
+        private MissingTransactionObservation(Scn observedAtCurrentScn, Instant lastCheckedAt) {
+            this.observedAtCurrentScn = observedAtCurrentScn;
+            this.lastCheckedAt = lastCheckedAt;
+            this.confirmations = 1;
+        }
+
+        private Scn getObservedAtCurrentScn() {
+            return observedAtCurrentScn;
+        }
+
+        private int getConfirmations() {
+            return confirmations;
+        }
+
+        private Instant getLastCheckedAt() {
+            return lastCheckedAt;
+        }
+
+        private void confirm(Instant checkedAt) {
+            this.confirmations++;
+            this.lastCheckedAt = checkedAt;
+        }
+
+        private boolean hasBeenMinedThrough(Scn endScn) {
+            return !observedAtCurrentScn.isNull() && endScn.compareTo(observedAtCurrentScn) >= 0;
+        }
+
+        private boolean canAbandonAt(Scn endScn) {
+            return confirmations >= MISSING_TRANSACTION_CONFIRMATIONS_TO_ABANDON && hasBeenMinedThrough(endScn);
         }
     }
 }

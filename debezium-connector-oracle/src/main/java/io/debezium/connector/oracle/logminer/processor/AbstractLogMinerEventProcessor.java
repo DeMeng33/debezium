@@ -305,18 +305,89 @@ public abstract class AbstractLogMinerEventProcessor<T extends AbstractTransacti
                     metrics.getMillisecondToSleepBetweenMiningQuery());
 
             metrics.addProcessedRows(counters.rows - rowsBefore);
-            if (readStats.outputRows == 0 && !readStats.truncated && getTransactionCache().isEmpty()) {
-                offsetContext.setScn(endScn);
-                metrics.setOldestScn(endScn);
-                metrics.setOffsetScn(endScn);
-                dispatcher.dispatchHeartbeatEvent(partition, offsetContext);
-                LOGGER.info("PL/SQL output LogMiner advanced empty window: scnRange=[{}, {}], offsetScn={}, activeTransactions=0",
-                        startScn, endScn, offsetContext.getScn());
-                return endScn;
+            if (readStats.outputRows == 0 && !readStats.truncated) {
+                final Scn advancedScn = advanceAfterEmptyPlSqlOutputWindow(partition, startScn, endScn);
+                if (advancedScn != null) {
+                    return advancedScn;
+                }
             }
             final Scn effectiveEndScn = readStats.getEffectiveEndScn(endScn);
             return calculateNewStartScn(effectiveEndScn, offsetContext.getCommitScn().getMaxCommittedScn());
         }
+    }
+
+    private Scn advanceAfterEmptyPlSqlOutputWindow(OraclePartition partition, Scn startScn, Scn endScn)
+            throws InterruptedException {
+        final int activeTransactionsBefore = getTransactionCache().size();
+        if (activeTransactionsBefore == 0) {
+            advanceOffsetAfterEmptyPlSqlOutputWindow(partition, endScn);
+            LOGGER.info("PL/SQL output LogMiner advanced empty window: scnRange=[{}, {}], offsetScn={}, activeTransactions=0",
+                    startScn, endScn, offsetContext.getScn());
+            return endScn;
+        }
+
+        final Scn minTransactionScnBefore = getTransactionCacheMinimumScn();
+        final String transactionIdsBefore = describeCachedTransactionIds();
+        maybeLogEmptyPlSqlOutputWindowWithActiveTransactions(startScn, endScn, activeTransactionsBefore,
+                minTransactionScnBefore, transactionIdsBefore);
+
+        abandonTransactionsAfterEmptyPlSqlOutputWindow(endScn);
+
+        final int activeTransactionsAfter = getTransactionCache().size();
+        if (activeTransactionsAfter == 0) {
+            advanceOffsetAfterEmptyPlSqlOutputWindow(partition, endScn);
+            LOGGER.info(
+                    "PL/SQL output LogMiner abandoned stale transaction(s) after empty window and advanced offset: scnRange=[{}, {}], offsetScn={}, activeTransactionsBefore={}, activeTransactionsAfter={}, minTransactionScnBefore={}, transactionIdsBefore={}, retention={}",
+                    startScn, endScn, offsetContext.getScn(), activeTransactionsBefore, activeTransactionsAfter,
+                    minTransactionScnBefore, transactionIdsBefore, getConfig().getLogMiningTransactionRetention());
+            return endScn;
+        }
+        return null;
+    }
+
+    private void advanceOffsetAfterEmptyPlSqlOutputWindow(OraclePartition partition, Scn endScn)
+            throws InterruptedException {
+        offsetContext.setScn(endScn);
+        metrics.setOldestScn(endScn);
+        metrics.setOffsetScn(endScn);
+        dispatcher.dispatchHeartbeatEvent(partition, offsetContext);
+    }
+
+    protected void abandonTransactionsAfterEmptyPlSqlOutputWindow(Scn endScn) throws InterruptedException {
+        abandonTransactions(getConfig().getLogMiningTransactionRetention());
+    }
+
+    private void maybeLogEmptyPlSqlOutputWindowWithActiveTransactions(Scn startScn, Scn endScn, int activeTransactions,
+                                                                      Scn minTransactionScn, String transactionIds) {
+        final Instant now = Instant.now();
+        if (Duration.between(lastPlSqlOutputActivityLogTime, now).compareTo(PLSQL_OUTPUT_IDLE_LOG_INTERVAL) >= 0) {
+            LOGGER.info(
+                    "PL/SQL output LogMiner empty window with active transactions: scnRange=[{}, {}], offsetScn={}, offsetCommitScn={}, activeTransactions={}, minTransactionScn={}, transactionIds={}, retention={}, emptyBatchesSinceLastLog={}",
+                    startScn, endScn, offsetContext.getScn(), offsetContext.getCommitScn(), activeTransactions,
+                    minTransactionScn, transactionIds, getConfig().getLogMiningTransactionRetention(), plSqlOutputEmptyBatchCount);
+            lastPlSqlOutputActivityLogTime = now;
+            plSqlOutputEmptyBatchCount = 0;
+        }
+    }
+
+    private String describeCachedTransactionIds() {
+        if (getTransactionCache().isEmpty()) {
+            return "[]";
+        }
+        final StringBuilder result = new StringBuilder("[");
+        int count = 0;
+        for (String transactionId : getTransactionCache().keySet()) {
+            if (count > 0) {
+                result.append(", ");
+            }
+            if (count == PLSQL_OUTPUT_SAMPLE_LIMIT) {
+                result.append("... total=").append(getTransactionCache().size());
+                break;
+            }
+            result.append(transactionId);
+            count++;
+        }
+        return result.append(']').toString();
     }
 
     private void maybeLogPlSqlOutputPolling(Scn startScn, Scn endScn) {

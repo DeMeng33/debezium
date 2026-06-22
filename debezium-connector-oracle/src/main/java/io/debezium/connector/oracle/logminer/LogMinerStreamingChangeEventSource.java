@@ -189,6 +189,7 @@ public class LogMinerStreamingChangeEventSource implements StreamingChangeEventS
                     }
 
                     int retryAttempts = 1;
+                    boolean rebuildLogFilesBeforeMiningSession = false;
                     Stopwatch sw = Stopwatch.accumulating().start();
                     while (context.isRunning()) {
                         // Calculate time difference before each mining session to detect time zone offset changes (e.g. DST) on database server
@@ -238,10 +239,26 @@ public class LogMinerStreamingChangeEventSource implements StreamingChangeEventS
 
                             // log switch or restart required, re-create a new stop watch
                             sw = Stopwatch.accumulating().start();
+                            rebuildLogFilesBeforeMiningSession = false;
+                        }
+
+                        if (rebuildLogFilesBeforeMiningSession) {
+                            LOGGER.warn("Rebuilding Oracle LogMiner log file list before retrying mining session: startScn={}, endScn={}, attempt={}",
+                                    startScn, endScn, retryAttempts);
+                            endMiningSession(jdbcConnection, offsetContext);
+                            initializeRedoLogsForMining(jdbcConnection, true, startScn, endScn);
+                            sw = Stopwatch.accumulating().start();
+                            rebuildLogFilesBeforeMiningSession = false;
+                        }
+
+                        if (ensureRedoLogsCoverMiningRange(jdbcConnection, offsetContext, startScn, endScn)) {
+                            sw = Stopwatch.accumulating().start();
+                            rebuildLogFilesBeforeMiningSession = false;
                         }
 
                         if (context.isRunning()) {
                             if (!startMiningSession(jdbcConnection, startScn, endScn, retryAttempts)) {
+                                rebuildLogFilesBeforeMiningSession = true;
                                 retryAttempts++;
                             }
                             else {
@@ -280,6 +297,24 @@ public class LogMinerStreamingChangeEventSource implements StreamingChangeEventS
             LOGGER.info("Streaming metrics dump: {}", streamingMetrics.toString());
             LOGGER.info("Offsets: {}", offsetContext);
         }
+    }
+
+    private boolean ensureRedoLogsCoverMiningRange(OracleConnection connection, OracleOffsetContext offsetContext, Scn startScn, Scn endScn)
+            throws SQLException {
+        if (isContinuousMining || currentLogFiles == null) {
+            return false;
+        }
+
+        Scn miningStartScn = startScn.add(Scn.ONE);
+        if (LogMinerHelper.hasLogFilesCoveringScnRange(currentLogFiles, miningStartScn, endScn)) {
+            return false;
+        }
+
+        LOGGER.info("{} rebuilding redo log list because current files do not cover mining range: scnRange=[{}, {}], currentLogFileCount={}, currentRedoLogSequences={}",
+                logPrefix(), miningStartScn, endScn, currentLogFiles.size(), currentRedoLogSequences);
+        endMiningSession(connection, offsetContext);
+        initializeRedoLogsForMining(connection, true, startScn, endScn);
+        return true;
     }
 
     /**
@@ -683,7 +718,8 @@ public class LogMinerStreamingChangeEventSource implements StreamingChangeEventS
         catch (SQLException e) {
             if (e.getErrorCode() == 1291 || e.getMessage().startsWith("ORA-01291")) {
                 if (attempts <= MINING_START_RETRIES) {
-                    LOGGER.warn("Failed to start Oracle LogMiner session, retrying...");
+                    LOGGER.warn("Failed to start Oracle LogMiner session due to missing logfile; will rebuild log file list and retry: startScn={}, endScn={}, attempt={}",
+                            startScn, endScn, attempts, e);
                     return false;
                 }
                 LOGGER.error("Failed to start Oracle LogMiner after '{}' attempts.", MINING_START_RETRIES, e);

@@ -9,6 +9,7 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
@@ -63,6 +64,10 @@ public class MemoryLogMinerEventProcessor extends AbstractLogMinerEventProcessor
     private final Map<String, Scn> recentlyProcessedTransactionsCache = new HashMap<>();
     private final Set<Scn> schemaChangesCache = new HashSet<>();
     private final Set<String> abandonedTransactionsCache = new HashSet<>();
+    private final Map<String, MissingTransactionObservation> missingTransactionsCache = new HashMap<>();
+
+    private static final int MISSING_TRANSACTION_CONFIRMATIONS_TO_ABANDON = 2;
+    private static final Duration MISSING_TRANSACTION_CHECK_INTERVAL = Duration.ofSeconds(30);
 
     public MemoryLogMinerEventProcessor(ChangeEventSourceContext context,
                                         OracleConnectorConfig connectorConfig,
@@ -169,6 +174,114 @@ public class MemoryLogMinerEventProcessor extends AbstractLogMinerEventProcessor
     }
 
     @Override
+    protected void abandonTransactionsAfterEmptyPlSqlOutputWindow(Scn endScn) throws InterruptedException {
+        abandonTransactions(getConfig().getLogMiningTransactionRetention());
+        abandonTransactionsMissingFromDatabase(endScn);
+    }
+
+    private void abandonTransactionsMissingFromDatabase(Scn endScn) {
+        missingTransactionsCache.keySet().removeIf(transactionId -> !transactionCache.containsKey(transactionId));
+
+        Iterator<Map.Entry<String, MemoryTransaction>> iterator = transactionCache.entrySet().iterator();
+        while (iterator.hasNext()) {
+            Map.Entry<String, MemoryTransaction> entry = iterator.next();
+            final String transactionId = entry.getKey();
+            final MissingTransactionObservation observation = missingTransactionsCache.get(transactionId);
+            if (observation != null && !shouldCheckMissingTransaction(endScn, observation)) {
+                LOGGER.debug(
+                        "PL/SQL output LogMiner keeping cached transaction {} while waiting to re-check V$TRANSACTION: startScn={}, endScn={}, missingObservedAtCurrentScn={}, confirmations={}",
+                        transactionId, entry.getValue().getStartScn(), endScn, observation.getObservedAtCurrentScn(), observation.getConfirmations());
+                continue;
+            }
+
+            if (isTransactionActiveInDatabase(transactionId)) {
+                missingTransactionsCache.remove(transactionId);
+                continue;
+            }
+
+            final MissingTransactionObservation updatedObservation = recordMissingTransactionObservation(transactionId, entry.getValue(), endScn, observation);
+            if (updatedObservation.canAbandonAt(endScn)) {
+                LOGGER.warn(
+                        "PL/SQL output LogMiner abandoning stale cached transaction {} after repeated V$TRANSACTION misses and mined SCN watermark: startScn={}, events={}, endScn={}, missingObservedAtCurrentScn={}, confirmations={}",
+                        transactionId, entry.getValue().getStartScn(), entry.getValue().getEvents().size(), endScn,
+                        updatedObservation.getObservedAtCurrentScn(), updatedObservation.getConfirmations());
+                abandonedTransactionsCache.add(entry.getKey());
+                iterator.remove();
+                missingTransactionsCache.remove(transactionId);
+                metrics.addAbandonedTransactionId(entry.getKey());
+                metrics.setActiveTransactions(transactionCache.size());
+            }
+        }
+        final Scn smallestScn = getTransactionCacheMinimumScn();
+        metrics.setOldestScn(smallestScn.isNull() ? Scn.valueOf(-1) : smallestScn);
+    }
+
+    private boolean shouldCheckMissingTransaction(Scn endScn, MissingTransactionObservation observation) {
+        if (observation.hasBeenMinedThrough(endScn)) {
+            return true;
+        }
+        return Duration.between(observation.getLastCheckedAt(), Instant.now()).compareTo(MISSING_TRANSACTION_CHECK_INTERVAL) >= 0;
+    }
+
+    private MissingTransactionObservation recordMissingTransactionObservation(String transactionId, MemoryTransaction transaction,
+                                                                             Scn endScn, MissingTransactionObservation observation) {
+        final Instant now = Instant.now();
+        if (observation == null) {
+            final Scn currentScn = getCurrentScnForMissingTransaction(transactionId);
+            final MissingTransactionObservation newObservation = new MissingTransactionObservation(currentScn, now);
+            missingTransactionsCache.put(transactionId, newObservation);
+            LOGGER.info(
+                    "PL/SQL output LogMiner observed cached transaction {} missing from V$TRANSACTION; keeping until mined through observed database SCN. startScn={}, events={}, endScn={}, missingObservedAtCurrentScn={}, confirmations={}",
+                    transactionId, transaction.getStartScn(), transaction.getEvents().size(), endScn, currentScn, newObservation.getConfirmations());
+            return newObservation;
+        }
+        if (observation.getObservedAtCurrentScn().isNull()) {
+            final Scn currentScn = getCurrentScnForMissingTransaction(transactionId);
+            final MissingTransactionObservation newObservation = new MissingTransactionObservation(currentScn, now);
+            missingTransactionsCache.put(transactionId, newObservation);
+            LOGGER.info(
+                    "PL/SQL output LogMiner refreshed missing transaction {} database SCN watermark after an earlier current SCN lookup failure. startScn={}, events={}, endScn={}, missingObservedAtCurrentScn={}, confirmations={}",
+                    transactionId, transaction.getStartScn(), transaction.getEvents().size(), endScn, currentScn, newObservation.getConfirmations());
+            return newObservation;
+        }
+
+        observation.confirm(now);
+        LOGGER.info(
+                "PL/SQL output LogMiner confirmed cached transaction {} still missing from V$TRANSACTION. startScn={}, events={}, endScn={}, missingObservedAtCurrentScn={}, confirmations={}, minedThroughObservedScn={}",
+                transactionId, transaction.getStartScn(), transaction.getEvents().size(), endScn,
+                observation.getObservedAtCurrentScn(), observation.getConfirmations(), observation.hasBeenMinedThrough(endScn));
+        return observation;
+    }
+
+    private Scn getCurrentScnForMissingTransaction(String transactionId) {
+        try {
+            return jdbcConnection.getCurrentScn();
+        }
+        catch (SQLException e) {
+            LOGGER.warn("Unable to read current SCN while checking missing transaction {}; using NULL watermark and keeping it in cache.", transactionId, e);
+            metrics.incrementWarningCount();
+            return Scn.NULL;
+        }
+    }
+
+    private boolean isTransactionActiveInDatabase(String transactionId) {
+        try (PreparedStatement statement = jdbcConnection.connection().prepareStatement(
+                "SELECT COUNT(1) FROM V$TRANSACTION WHERE RAWTOHEX(XID) = UPPER(?)")) {
+            statement.setString(1, transactionId);
+            final Integer count;
+            try (ResultSet rs = statement.executeQuery()) {
+                count = rs.next() ? rs.getInt(1) : 0;
+            }
+            return count != null && count > 0;
+        }
+        catch (SQLException e) {
+            LOGGER.warn("Unable to check whether transaction {} is active in V$TRANSACTION; keeping it in cache.", transactionId, e);
+            metrics.incrementWarningCount();
+            return true;
+        }
+    }
+
+    @Override
     protected boolean isRecentlyProcessed(String transactionId) {
         return recentlyProcessedTransactionsCache.containsKey(transactionId);
     }
@@ -180,12 +293,14 @@ public class MemoryLogMinerEventProcessor extends AbstractLogMinerEventProcessor
 
     @Override
     protected MemoryTransaction getAndRemoveTransactionFromCache(String transactionId) {
+        missingTransactionsCache.remove(transactionId);
         return getTransactionCache().remove(transactionId);
     }
 
     @Override
     protected void removeTransactionAndEventsFromCache(MemoryTransaction transaction) {
         abandonedTransactionsCache.remove(transaction.getTransactionId());
+        missingTransactionsCache.remove(transaction.getTransactionId());
     }
 
     @Override
@@ -205,6 +320,7 @@ public class MemoryLogMinerEventProcessor extends AbstractLogMinerEventProcessor
     protected void finalizeTransactionRollback(String transactionId, Scn rollbackScn) {
         transactionCache.remove(transactionId);
         abandonedTransactionsCache.remove(transactionId);
+        missingTransactionsCache.remove(transactionId);
         if (getConfig().isLobEnabled()) {
             recentlyProcessedTransactionsCache.put(transactionId, rollbackScn);
         }
@@ -231,6 +347,7 @@ public class MemoryLogMinerEventProcessor extends AbstractLogMinerEventProcessor
                 transaction = createTransaction(row);
                 getTransactionCache().put(transactionId, transaction);
             }
+            missingTransactionsCache.remove(transactionId);
 
             int eventId = transaction.getNextEventId();
             if (transaction.getEvents().size() <= eventId) {
@@ -342,5 +459,42 @@ public class MemoryLogMinerEventProcessor extends AbstractLogMinerEventProcessor
                 .map(MemoryTransaction::getStartScn)
                 .min(Scn::compareTo)
                 .orElse(Scn.NULL);
+    }
+
+    private static class MissingTransactionObservation {
+        private final Scn observedAtCurrentScn;
+        private int confirmations;
+        private Instant lastCheckedAt;
+
+        private MissingTransactionObservation(Scn observedAtCurrentScn, Instant lastCheckedAt) {
+            this.observedAtCurrentScn = observedAtCurrentScn;
+            this.lastCheckedAt = lastCheckedAt;
+            this.confirmations = 1;
+        }
+
+        private Scn getObservedAtCurrentScn() {
+            return observedAtCurrentScn;
+        }
+
+        private int getConfirmations() {
+            return confirmations;
+        }
+
+        private Instant getLastCheckedAt() {
+            return lastCheckedAt;
+        }
+
+        private void confirm(Instant checkedAt) {
+            this.confirmations++;
+            this.lastCheckedAt = checkedAt;
+        }
+
+        private boolean hasBeenMinedThrough(Scn endScn) {
+            return !observedAtCurrentScn.isNull() && endScn.compareTo(observedAtCurrentScn) >= 0;
+        }
+
+        private boolean canAbandonAt(Scn endScn) {
+            return confirmations >= MISSING_TRANSACTION_CONFIRMATIONS_TO_ABANDON && hasBeenMinedThrough(endScn);
+        }
     }
 }

@@ -12,8 +12,11 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.stream.Collectors;
@@ -76,13 +79,24 @@ public class LogMinerHelper {
         // but the V$ARCHIVED_LOG lags behind and a single-shot SQL query may return an inconsistent set of results
         // due to Oracle performing the operation non-atomically.
         List<LogFile> logFilesForMining = new ArrayList<>();
+        List<LogFile> lastLogFilesForMining = new ArrayList<>();
+        boolean miningRangeCoverageMissing = false;
         for (int attempt = 0; attempt <= maxAttempts; ++attempt) {
             logFilesForMining.addAll(getLogFilesForOffsetScn(connection, lastProcessedScn, endScn, archiveLogRetention,
                     archiveLogOnlyMode, archiveDestinationName));
+            lastLogFilesForMining = new ArrayList<>(logFilesForMining);
             // we don't need lastProcessedSCN in the logs, as that one was already processed, but we do want
             // the next SCN to be present, as that is where we'll start processing from.
             if (!hasLogFilesStartingBeforeOrAtScn(logFilesForMining, lastProcessedScn.add(Scn.ONE))) {
                 LOGGER.info("No logs available yet (attempt {})...", attempt + 1);
+                logFilesForMining.clear();
+                retryStrategy.sleepWhen(true);
+                continue;
+            }
+            if (!hasLogFilesCoveringScnRange(logFilesForMining, lastProcessedScn.add(Scn.ONE), endScn)) {
+                miningRangeCoverageMissing = true;
+                LOGGER.info("Log files do not cover mining range [{}, {}] yet (attempt {}): {}",
+                        lastProcessedScn.add(Scn.ONE), endScn, attempt + 1, logFilesForMining);
                 logFilesForMining.clear();
                 retryStrategy.sleepWhen(true);
                 continue;
@@ -105,11 +119,59 @@ public class LogMinerHelper {
                     lastProcessedScn + "is not yet in any available archive logs. " +
                     "Please perform an Oracle log switch and restart the connector.");
         }
+        if (miningRangeCoverageMissing) {
+            throw new IllegalStateException("Log files do not cover mining range [" + lastProcessedScn.add(Scn.ONE) + ", " + endScn +
+                    "], re-snapshot may be required. Available logs: " + lastLogFilesForMining);
+        }
         throw new IllegalStateException("None of log files contains offset SCN: " + lastProcessedScn + ", re-snapshot is required.");
     }
 
     private static boolean hasLogFilesStartingBeforeOrAtScn(List<LogFile> logs, Scn scn) {
         return logs.stream().anyMatch(l -> l.getFirstScn().compareTo(scn) <= 0);
+    }
+
+    static boolean hasLogFilesCoveringScnRange(List<LogFile> logs, Scn startScn, Scn endScn) {
+        if (endScn == null || endScn.isNull() || startScn.compareTo(endScn) > 0) {
+            return true;
+        }
+
+        Map<Integer, List<LogFile>> logsByThread = logs.stream()
+                .collect(Collectors.groupingBy(LogFile::getThread, LinkedHashMap::new, Collectors.toList()));
+        boolean coveredByAtLeastOneThread = false;
+        for (List<LogFile> threadLogs : logsByThread.values()) {
+            if (!threadLogs.stream().anyMatch(l -> l.getFirstScn().compareTo(startScn) <= 0)) {
+                continue;
+            }
+            coveredByAtLeastOneThread = true;
+            if (!hasThreadLogFilesCoveringScnRange(threadLogs, startScn, endScn)) {
+                return false;
+            }
+        }
+        return coveredByAtLeastOneThread;
+    }
+
+    private static boolean hasThreadLogFilesCoveringScnRange(List<LogFile> logs, Scn startScn, Scn endScn) {
+        List<LogFile> sortedLogs = logs.stream()
+                .sorted(Comparator.comparing(LogFile::getFirstScn))
+                .collect(Collectors.toList());
+        Scn coveredUntil = startScn;
+        for (LogFile log : sortedLogs) {
+            if (!log.getNextScn().equals(Scn.MAX) && log.getNextScn().compareTo(coveredUntil) <= 0) {
+                continue;
+            }
+            if (log.getFirstScn().compareTo(coveredUntil) > 0) {
+                LOGGER.warn("Missing LogMiner log coverage before SCN {} in thread {} while mining [{}, {}]. Available logs: {}",
+                        coveredUntil, log.getThread(), startScn, endScn, sortedLogs);
+                return false;
+            }
+            coveredUntil = log.getNextScn();
+            if (coveredUntil.compareTo(endScn) > 0 || coveredUntil.equals(Scn.MAX)) {
+                return true;
+            }
+        }
+        LOGGER.warn("Missing LogMiner log coverage through SCN {} while mining [{}, {}]. Available logs: {}",
+                endScn, startScn, endScn, sortedLogs);
+        return false;
     }
 
     private static Scn getMinimumScn(List<LogFile> logs) {
