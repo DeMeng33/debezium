@@ -13,6 +13,17 @@ English | [Chinese](README_ZH.md) | [Japanese](README_JA.md)
 
 # Debezium
 
+## Fork notes
+
+This repository is a custom fork based on Debezium `v1.9.8.Final`. It is not an
+official Debezium release branch.
+
+The main difference from the upstream `v1.9.8.Final` tag is an additional Oracle
+LogMiner strategy named `plsql_output` (`log.mining.strategy=plsql_output`).
+This strategy reads LogMiner rows by executing an anonymous PL/SQL block and
+consuming `DBMS_OUTPUT` lines, instead of fetching `V$LOGMNR_CONTENTS` directly
+through a JDBC `ResultSet`.
+
 Debezium is an open source project that provides a low latency data streaming platform for change data capture (CDC). You setup and configure Debezium to monitor your databases, and then your applications consume events for each row-level change made to the database. Only committed changes are visible, so your application doesn't have to worry about transactions or changes that are rolled back. Debezium provides a single model of all change events, so your application does not have to worry about the intricacies of each kind of database management system. Additionally, since Debezium records the history of data changes in durable, replicated logs, your application can be stopped and restarted at any time, and it will be able to consume all of the events it missed while it was not running, ensuring that all events are processed correctly and completely.
 
 Monitoring databases and being notified when data changes has always been complicated. Relational database triggers can be useful, but are specific to each database and often limited to updating state within the same database (not communicating with external processes). Some databases offer APIs or frameworks for monitoring changes, but there is no standard so each database's approach is different and requires a lot of knowledged and specialized code. It still is very challenging to ensure that all changes are seen and processed in the same order while minimally impacting the database.

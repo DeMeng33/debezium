@@ -13,6 +13,14 @@ The Antlr grammars within the debezium-ddl-parser module are licensed under the 
 
 # Debezium 简介
 
+## Fork 说明
+
+本仓库是基于 Debezium `v1.9.8.Final` 的定制 fork，不是 Debezium 官方发布分支。
+
+与上游 `v1.9.8.Final` tag 的主要区别是：Oracle LogMiner 增加了一个名为
+`plsql_output` 的策略（`log.mining.strategy=plsql_output`）。该策略通过执行匿名
+PL/SQL 块并消费 `DBMS_OUTPUT` 行来读取 LogMiner 数据，而不是直接通过 JDBC
+`ResultSet` 查询 `V$LOGMNR_CONTENTS`。
 
 Debezium是一个开源项目，为捕获数据更改(change data capture,CDC)提供了一个低延迟的流式处理平台。你可以安装并且配置Debezium去监控你的数据库，然后你的应用就可以消费对数据库的每一个行级别(row-level)的更改。只有已提交的更改才是可见的，所以你的应用不用担心事务(transaction)或者更改被回滚(roll back)。Debezium为所有的数据库更改事件提供了一个统一的模型，所以你的应用不用担心每一种数据库管理系统的错综复杂性。另外，由于Debezium用持久化的、有副本备份的日志来记录数据库数据变化的历史，因此，你的应用可以随时停止再重启，而不会错过它停止运行时发生的事件，保证了所有的事件都能被正确地、完全地处理掉。
 
