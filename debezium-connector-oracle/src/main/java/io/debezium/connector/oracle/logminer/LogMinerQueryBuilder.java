@@ -160,11 +160,13 @@ public class LogMinerQueryBuilder {
         final String pdbPredicate = Strings.isNullOrEmpty(connectorConfig.getPdbName()) ? null : "SRC_CON_NAME = '" + connectorConfig.getPdbName() + "'";
         final String rowPredicate = buildPlSqlCapturedTablePredicate(connectorConfig, "r.", dmlOperationCodes, pdbPredicate);
         final String ddlPredicate = buildPlSqlDdlPredicate(connectorConfig, schema, "r.", pdbPredicate);
-        final String query = PLSQL_OUTPUT_SELECT_LIST.replace("FROM " + LOGMNR_CONTENTS_VIEW + " ", "FROM " + LOGMNR_CONTENTS_VIEW + " r ") +
+        final String unorderedQuery = PLSQL_OUTPUT_SELECT_LIST.replace("SELECT ", "SELECT ROWNUM AS LOGMNR_ROW_SEQUENCE, ")
+                .replace("FROM " + LOGMNR_CONTENTS_VIEW + " ", "FROM " + LOGMNR_CONTENTS_VIEW + " r ") +
                 "WHERE r.SCN > ? AND r.SCN <= ? " +
                 "AND ((" + rowPredicate + ") " +
                 "OR (r.OPERATION_CODE IN (7,34,36)) " +
                 "OR (" + ddlPredicate + "))";
+        final String query = "SELECT q.* FROM (" + unorderedQuery + ") q ORDER BY q.SCN, q.LOGMNR_ROW_SEQUENCE";
 
         return "DECLARE " +
                 "l_output_bytes NUMBER := 0; " +

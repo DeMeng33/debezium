@@ -140,6 +140,19 @@ public class LogMinerQueryBuilderTest {
     }
 
     @Test
+    public void testPlSqlOutputQueryOrdersByScnWithoutReorderingSameScnRows() {
+        final Configuration config = TestHelper.defaultConfig().build();
+        final OracleConnectorConfig connectorConfig = new OracleConnectorConfig(config);
+        schema = createSchema(connectorConfig);
+
+        final String result = LogMinerQueryBuilder.buildPlSqlOutputBlock(connectorConfig, schema);
+
+        assertThat(result.contains("SELECT ROWNUM AS LOGMNR_ROW_SEQUENCE, SCN, SQL_REDO")).isTrue();
+        assertThat(result.contains("ORDER BY q.SCN, q.LOGMNR_ROW_SEQUENCE")).isTrue();
+        assertThat(result.contains("ORDER BY q.SCN, q.RS_ID, q.SSN")).isFalse();
+    }
+
+    @Test
     @FixFor("DBZ-3009")
     public void testLogMinerQueryWithSchemaInclude() {
         String schema = "AND (REGEXP_LIKE(SEG_OWNER,'^SCHEMA1$','i') OR REGEXP_LIKE(SEG_OWNER,'^SCHEMA2$','i')) ";
